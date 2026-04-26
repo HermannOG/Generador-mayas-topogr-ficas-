@@ -206,14 +206,6 @@ document.querySelectorAll(".shape-btn").forEach(btn => {
   });
 });
 
-// ── Quality buttons ────────────────────────────────────────────────────────
-document.querySelectorAll(".quality-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".quality-btn").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-  });
-});
-
 // ── Color pickers ──────────────────────────────────────────────────────────
 function bindColorBar(barId, inputId) {
   const bar = document.getElementById(barId);
@@ -256,7 +248,6 @@ function collectSettings() {
     base_size:         parseFloat(document.getElementById("baseSize")?.value     ?? 100),
     high_resolution:   document.getElementById("highRes")?.checked   ?? false,
     cache_id:          tiles[activeTileIdx]?.cacheId ?? null,
-    preview_quality:   parseInt(document.querySelector(".quality-btn.active")?.dataset.q ?? "50"),
   };
 }
 
