@@ -208,100 +208,90 @@ class MeshGenerator:
                 V[i, j] = [x, y, self.ele_to_z(elevation_grid[i, j])]
                 inside[i, j] = self._shape_poly.contains(Point(x, y))
 
-        def fq(i, j):
-            return (0 <= i < rows-1 and 0 <= j < cols-1 and
-                    bool(inside[i,j]) and bool(inside[i,j+1]) and
-                    bool(inside[i+1,j]) and bool(inside[i+1,j+1]))
-
-        tris = []
-
+        # ── Top surface: full quads + Shapely-clipped boundary quads ─────
+        top_tris = []
         for i in range(rows - 1):
             for j in range(cols - 1):
-                if not fq(i, j):
+                n_in = int(inside[i,j]) + int(inside[i,j+1]) + int(inside[i+1,j+1]) + int(inside[i+1,j])
+                if n_in == 0:
                     continue
+                if n_in == 4:
+                    v00 = V[i,   j  ].tolist(); v01 = V[i,   j+1].tolist()
+                    v10 = V[i+1, j  ].tolist(); v11 = V[i+1, j+1].tolist()
+                    top_tris.append((v00, v11, v01))
+                    top_tris.append((v00, v10, v11))
+                else:
+                    quad_poly = Polygon([
+                        (V[i,j][0],     V[i,j][1]),
+                        (V[i,j+1][0],   V[i,j+1][1]),
+                        (V[i+1,j+1][0], V[i+1,j+1][1]),
+                        (V[i+1,j][0],   V[i+1,j][1]),
+                    ])
+                    clipped = self._shape_poly.intersection(quad_poly)
+                    if clipped.is_empty:
+                        continue
+                    geoms = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
+                    for geom in geoms:
+                        if geom.geom_type != "Polygon" or geom.is_empty:
+                            continue
+                        pts2d = list(geom.exterior.coords[:-1])
+                        if len(pts2d) < 3:
+                            continue
+                        verts = []
+                        for px, py in pts2d:
+                            la, lo = self._xy_to_ll(px, py)
+                            verts.append([px, py, self.z_at(la, lo)])
+                        for k in range(1, len(verts) - 1):
+                            v0, v1, v2 = verts[0], verts[k], verts[k+1]
+                            cz = (v1[0]-v0[0])*(v2[1]-v0[1]) - (v1[1]-v0[1])*(v2[0]-v0[0])
+                            top_tris.append((v0, v1, v2) if cz >= 0 else (v0, v2, v1))
 
-                v00 = V[i,   j  ].tolist()  # NW
-                v01 = V[i,   j+1].tolist()  # NE
-                v10 = V[i+1, j  ].tolist()  # SW
-                v11 = V[i+1, j+1].tolist()  # SE
-                b00 = [v00[0], v00[1], 0.0]
-                b01 = [v01[0], v01[1], 0.0]
-                b10 = [v10[0], v10[1], 0.0]
-                b11 = [v11[0], v11[1], 0.0]
+        # ── Detect boundary edges (appear in exactly 1 triangle) ─────────
+        PREC = 3
+        def vk(v): return (round(v[0], PREC), round(v[1], PREC), round(v[2], PREC))
 
-                # Top face (normal +Z)
-                tris.append((v00, v11, v01))
-                tris.append((v00, v10, v11))
+        edge_cnt = {}
+        edge_dir = {}
+        for tri in top_tris:
+            for k in range(3):
+                a, b = vk(tri[k]), vk(tri[(k+1) % 3])
+                key = (min(a, b), max(a, b))
+                edge_cnt[key] = edge_cnt.get(key, 0) + 1
+                edge_dir[key] = (tri[k], tri[(k+1) % 3])
 
-                # Bottom face (normal -Z)
-                tris.append((b00, b01, b11))
-                tris.append((b00, b11, b10))
+        tris = list(top_tris)
+        bot_pts = []
 
-                # North wall (+Y) – exposed if no full quad above
-                if not fq(i-1, j):
-                    tris.append((v00, v01, b01))
-                    tris.append((v00, b01, b00))
+        # ── Smooth walls: drop each boundary edge straight to z = 0 ──────
+        for key, cnt in edge_cnt.items():
+            if cnt != 1:
+                continue
+            t1, t2 = edge_dir[key]
+            b1 = [t1[0], t1[1], 0.0]
+            b2 = [t2[0], t2[1], 0.0]
+            tris.append((t2, t1, b1))   # outward-facing (right of t1→t2)
+            tris.append((t2, b1, b2))
+            bot_pts.append((t1[0], t1[1]))
+            bot_pts.append((t2[0], t2[1]))
 
-                # South wall (-Y) – exposed if no full quad below
-                if not fq(i+1, j):
-                    tris.append((v11, v10, b10))
-                    tris.append((v11, b10, b11))
-
-                # West wall (-X) – exposed if no full quad to the left
-                if not fq(i, j-1):
-                    tris.append((v10, v00, b10))
-                    tris.append((v00, b00, b10))
-
-                # East wall (+X) – exposed if no full quad to the right
-                if not fq(i, j+1):
-                    tris.append((v01, v11, b11))
-                    tris.append((v01, b11, b01))
+        # ── Bottom face: sort boundary projection by angle, fan-tri ──────
+        if bot_pts:
+            cx, cy = self.model_w / 2, self.model_h / 2
+            seen, uniq = set(), []
+            for p in bot_pts:
+                pk = (round(p[0], PREC), round(p[1], PREC))
+                if pk not in seen:
+                    seen.add(pk); uniq.append(p)
+            uniq.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+            n = len(uniq)
+            if n >= 3:
+                cpt = [cx, cy, 0.0]
+                for k in range(n):
+                    p0 = [uniq[k][0],         uniq[k][1],         0.0]
+                    p1 = [uniq[(k+1) % n][0], uniq[(k+1) % n][1], 0.0]
+                    tris.append((cpt, p1, p0))  # -Z normal
 
         return tris
-
-    def _add_square_base(self, tris, V, rows, cols):
-        w, h = self.model_w, self.model_h
-
-        # Bottom face (normal → −Z, CW from above)
-        tris.append(([0,0,0], [w,h,0], [w,0,0]))
-        tris.append(([0,0,0], [0,h,0], [w,h,0]))
-
-        def wall(edge, flip):
-            for k in range(len(edge) - 1):
-                t, tn = edge[k], edge[k+1]
-                b  = [t[0],  t[1],  0.0]
-                bn = [tn[0], tn[1], 0.0]
-                if not flip:
-                    tris.append((list(t),  b,  bn)); tris.append((list(t), bn, list(tn)))
-                else:
-                    tris.append((list(t), bn,   b)); tris.append((list(t), list(tn), bn))
-
-        wall([V[rows-1, j] for j in range(cols)], flip=False)   # south
-        wall([V[0,      j] for j in range(cols)], flip=True)    # north
-        wall([V[i,      0] for i in range(rows)], flip=True)    # west
-        wall([V[i, cols-1] for i in range(rows)], flip=False)   # east
-
-    def _add_shaped_base(self, tris):
-        cx, cy = self.model_w / 2, self.model_h / 2
-        outline = list(self._shape_poly.exterior.coords)
-
-        # Bottom face (fan from centre, normal → −Z)
-        for k in range(len(outline) - 1):
-            p0 = [outline[k][0],   outline[k][1],   0]
-            p1 = [outline[k+1][0], outline[k+1][1], 0]
-            pc = [cx, cy, 0]
-            tris.append((pc, p1, p0))
-
-        # Side walls along shape boundary
-        for k in range(len(outline) - 1):
-            x0, y0 = outline[k]
-            x1, y1 = outline[k+1]
-            lat0, lon0 = self._xy_to_ll(x0, y0)
-            lat1, lon1 = self._xy_to_ll(x1, y1)
-            z0t = self.z_at(lat0, lon0)
-            z1t = self.z_at(lat1, lon1)
-            tris.append(([x0,y0,0],    [x0,y0,z0t], [x1,y1,z1t]))
-            tris.append(([x0,y0,0],    [x1,y1,z1t], [x1,y1,0]))
 
     # ── Buildings ────────────────────────────────────────────────────────
 
