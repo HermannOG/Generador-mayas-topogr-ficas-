@@ -316,7 +316,7 @@ async function generateSTL() {
 
   const settings = collectSettings();
 
-  const qualityLabels = { standard: "~30 s", high: "~70 s", ultra: "2–4 min" };
+  const qualityLabels = { standard: "~30 s", high: "~70 s", ultra: "~2–3 min" };
   const qLabel = qualityLabels[settings.stl_quality] ?? "30–120 s";
   loadingOverlay.hidden = false;
   loadingTitle.textContent = "Generando tu mapa 3D…";

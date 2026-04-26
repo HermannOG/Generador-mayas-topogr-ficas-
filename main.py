@@ -151,7 +151,7 @@ async def preview_mesh_endpoint(
         raise HTTPException(400, "No se pueden calcular límites")
 
     lat_c, lon_c, size_km = _resolve_center(cfg, points, bounds)
-    resolution = {"standard": 50, "high": 100, "ultra": 150}.get(
+    resolution = {"standard": 50, "high": 70, "ultra": 100}.get(
         cfg.get("stl_quality", "standard"), 50
     )
 
@@ -248,7 +248,7 @@ async def generate(
     lat_c, lon_c, _ = _resolve_center(cfg, points, bounds)
 
     size_km = bounds["size_km"]
-    resolution = {"standard": 50, "high": 100, "ultra": 150}.get(
+    resolution = {"standard": 50, "high": 70, "ultra": 100}.get(
         cfg.get("stl_quality", "standard"), 50
     )
 
