@@ -332,16 +332,17 @@ class MeshGenerator:
     def _route(self, points):
         hw     = self.route_width_mm / 2.0
         raise_ = self.route_height_mm
+        # Keep vertices at least 2×hw apart to avoid direction-flip artifacts
+        min_step = max(hw * 2.0, 0.3)
 
-        # Convert to model space; decimate so consecutive points are at
-        # least hw apart (eliminates GPS-jitter spikes at sharp joints)
+        # Convert to model space with decimation
         mpts = []
         for p in points:
             lat, lon = p[0], p[1]
             if not self._in_bounds(lat, lon):
                 continue
             x, y = self.ll_to_xy(lat, lon)
-            if mpts and math.hypot(x - mpts[-1][0], y - mpts[-1][1]) < hw:
+            if mpts and math.hypot(x - mpts[-1][0], y - mpts[-1][1]) < min_step:
                 continue
             mpts.append([x, y, self.z_at(lat, lon)])
 
@@ -349,52 +350,32 @@ class MeshGenerator:
         if n < 2:
             return []
 
-        # Per-segment unit perpendicular (left-pointing)
-        perps = []
-        for i in range(n - 1):
-            dx, dy = mpts[i+1][0] - mpts[i][0], mpts[i+1][1] - mpts[i][1]
-            L = math.hypot(dx, dy) or 1e-9
-            perps.append((-dy / L, dx / L))
-
-        # Per-vertex miter offset (capped at 3× to handle sharp corners)
-        def _miter(a, b):
-            mx, my = (a[0]+b[0]) * 0.5, (a[1]+b[1]) * 0.5
-            L = math.hypot(mx, my) or 1e-9
-            s = min(1.0 / L, 3.0)
-            return mx * s, my * s
-
-        offs = []
-        for i in range(n):
-            if   i == 0:     offs.append(perps[0])
-            elif i == n - 1: offs.append(perps[-1])
-            else:            offs.append(_miter(perps[i-1], perps[i]))
-
-        # Build 3-D vertex arrays
-        Lv, Rv, Lb, Rb = [], [], [], []
-        for i in range(n):
-            ox, oy = offs[i][0] * hw, offs[i][1] * hw
-            x, y, z = mpts[i]
-            Lv.append([x+ox, y+oy, z+raise_])
-            Rv.append([x-ox, y-oy, z+raise_])
-            Lb.append([x+ox, y+oy, z])
-            Rb.append([x-ox, y-oy, z])
-
         tris = []
         for i in range(n - 1):
-            l0,r0,lb0,rb0 = Lv[i],   Rv[i],   Lb[i],   Rb[i]
-            l1,r1,lb1,rb1 = Lv[i+1], Rv[i+1], Lb[i+1], Rb[i+1]
-            # Top
-            tris.append((l0, r0, r1)); tris.append((l0, r1, l1))
-            # Bottom
-            tris.append((lb0, rb1, rb0)); tris.append((lb0, lb1, rb1))
-            # Left wall
-            tris.append((l0, l1, lb1)); tris.append((l0, lb1, lb0))
-            # Right wall
-            tris.append((r0, rb0, rb1)); tris.append((r0, rb1, r1))
+            x0, y0, zb0 = mpts[i]
+            x1, y1, zb1 = mpts[i+1]
+            dx, dy = x1 - x0, y1 - y0
+            L = math.hypot(dx, dy) or 1e-9
+            nx, ny = -dy / L * hw, dx / L * hw   # perpendicular offset
+            zt0, zt1 = zb0 + raise_, zb1 + raise_
 
-        # End caps (close the ribbon into a watertight solid)
-        tris.append((Lv[0],  Lb[0],  Rb[0]));  tris.append((Lv[0],  Rb[0],  Rv[0]))
-        tris.append((Lv[-1], Rv[-1], Rb[-1])); tris.append((Lv[-1], Rb[-1], Lb[-1]))
+            l0  = [x0+nx, y0+ny, zt0];  r0  = [x0-nx, y0-ny, zt0]
+            l1  = [x1+nx, y1+ny, zt1];  r1  = [x1-nx, y1-ny, zt1]
+            b0l = [x0+nx, y0+ny, zb0];  b0r = [x0-nx, y0-ny, zb0]
+            b1l = [x1+nx, y1+ny, zb1];  b1r = [x1-nx, y1-ny, zb1]
+
+            # Top (+Z normal)
+            tris.append((l0, r0, r1)); tris.append((l0, r1, l1))
+            # Bottom (-Z normal)
+            tris.append((b0l, b1r, b0r)); tris.append((b0l, b1l, b1r))
+            # Left wall (+Y-ish outward)
+            tris.append((l0, l1, b1l)); tris.append((l0, b1l, b0l))
+            # Right wall (-Y-ish outward)
+            tris.append((r0, b0r, b1r)); tris.append((r0, b1r, r1))
+            # Start cap (-X-ish, closes each segment independently)
+            tris.append((l0, b0l, b0r)); tris.append((l0, b0r, r0))
+            # End cap (+X-ish)
+            tris.append((l1, r1, b1r)); tris.append((l1, b1r, b1l))
 
         return tris
 
