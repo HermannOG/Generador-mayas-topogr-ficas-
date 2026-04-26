@@ -14,8 +14,8 @@ import struct
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
-from shapely.geometry import Point, Polygon
-from shapely.ops import unary_union
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon
+from shapely.ops import triangulate as shp_triangulate, unary_union
 
 
 class MeshGenerator:
@@ -332,69 +332,76 @@ class MeshGenerator:
     def _route(self, points):
         hw     = self.route_width_mm / 2.0
         raise_ = self.route_height_mm
+        MIN_D  = hw * 0.5   # minimum spacing to remove GPS jitter
 
-        # Convert to model space; decimate so consecutive points are at
-        # least hw apart (eliminates GPS-jitter spikes at sharp joints)
-        mpts = []
+        # Convert to model 2D, skip out-of-bounds, decimate
+        pts2d = []
         for p in points:
             lat, lon = p[0], p[1]
             if not self._in_bounds(lat, lon):
                 continue
             x, y = self.ll_to_xy(lat, lon)
-            if mpts and math.hypot(x - mpts[-1][0], y - mpts[-1][1]) < hw:
+            if pts2d and math.hypot(x - pts2d[-1][0], y - pts2d[-1][1]) < MIN_D:
                 continue
-            mpts.append([x, y, self.z_at(lat, lon)])
+            pts2d.append((x, y))
 
-        n = len(mpts)
-        if n < 2:
+        if len(pts2d) < 2:
             return []
 
-        # Per-segment unit perpendicular (left-pointing)
-        perps = []
-        for i in range(n - 1):
-            dx, dy = mpts[i+1][0] - mpts[i][0], mpts[i+1][1] - mpts[i][1]
-            L = math.hypot(dx, dy) or 1e-9
-            perps.append((-dy / L, dx / L))
+        def z_xy(x, y):
+            lat, lon = self._xy_to_ll(x, y)
+            return self.z_at(lat, lon)
 
-        # Per-vertex miter offset (capped at 3× to handle sharp corners)
-        def _miter(a, b):
-            mx, my = (a[0]+b[0]) * 0.5, (a[1]+b[1]) * 0.5
-            L = math.hypot(mx, my) or 1e-9
-            s = min(1.0 / L, 3.0)
-            return mx * s, my * s
+        # Buffer the 2D path → smooth ribbon (round joins, flat end caps)
+        ribbon = LineString(pts2d).buffer(hw, cap_style=2, join_style=1, resolution=8)
+        if ribbon.is_empty:
+            return []
 
-        offs = []
-        for i in range(n):
-            if   i == 0:     offs.append(perps[0])
-            elif i == n - 1: offs.append(perps[-1])
-            else:            offs.append(_miter(perps[i-1], perps[i]))
+        polys = list(ribbon.geoms) if isinstance(ribbon, MultiPolygon) else [ribbon]
 
-        # Build 3-D vertex arrays
-        Lv, Rv, Lb, Rb = [], [], [], []
-        for i in range(n):
-            ox, oy = offs[i][0] * hw, offs[i][1] * hw
-            x, y, z = mpts[i]
-            Lv.append([x+ox, y+oy, z+raise_])
-            Rv.append([x-ox, y-oy, z+raise_])
-            Lb.append([x+ox, y+oy, z])
-            Rb.append([x-ox, y-oy, z])
+        PREC = 3
 
-        tris = []
-        for i in range(n - 1):
-            l0,r0,lb0,rb0 = Lv[i],   Rv[i],   Lb[i],   Rb[i]
-            l1,r1,lb1,rb1 = Lv[i+1], Rv[i+1], Lb[i+1], Rb[i+1]
-            # Top
-            tris.append((l0, r0, r1)); tris.append((l0, r1, l1))
-            # Bottom
-            tris.append((lb0, rb1, rb0)); tris.append((lb0, lb1, rb1))
-            # Left wall
-            tris.append((l0, l1, lb1)); tris.append((l0, lb1, lb0))
-            # Right wall
-            tris.append((r0, rb0, rb1)); tris.append((r0, rb1, r1))
+        def vk(v):
+            return (round(v[0], PREC), round(v[1], PREC), round(v[2], PREC))
 
-        # End caps (close the ribbon into a watertight solid)
-        tris.append((Lv[0],  Lb[0],  Rb[0]));  tris.append((Lv[0],  Rb[0],  Rv[0]))
-        tris.append((Lv[-1], Rv[-1], Rb[-1])); tris.append((Lv[-1], Rb[-1], Lb[-1]))
+        top_tris = []
+        for poly in polys:
+            for t in shp_triangulate(poly):
+                if not poly.contains(t.centroid):
+                    continue
+                c = list(t.exterior.coords)[:3]
+                tv = [[x, y, z_xy(x, y) + raise_] for x, y in c]
+                cz = ((tv[1][0]-tv[0][0])*(tv[2][1]-tv[0][1]) -
+                      (tv[1][1]-tv[0][1])*(tv[2][0]-tv[0][0]))
+                if cz < 0:
+                    tv[1], tv[2] = tv[2], tv[1]
+                top_tris.append(tuple(tv))
+
+        tris = list(top_tris)
+
+        # Bottom face (reversed winding, at terrain surface)
+        for tri in top_tris:
+            bv = [[v[0], v[1], z_xy(v[0], v[1])] for v in tri]
+            tris.append((bv[0], bv[2], bv[1]))
+
+        # Side walls from boundary edges of the top surface
+        edge_cnt = {}
+        edge_dir = {}
+        for tri in top_tris:
+            for k in range(3):
+                a, b = vk(tri[k]), vk(tri[(k+1) % 3])
+                key = (min(a, b), max(a, b))
+                edge_cnt[key] = edge_cnt.get(key, 0) + 1
+                edge_dir[key] = (list(tri[k]), list(tri[(k+1) % 3]))
+
+        for key, cnt in edge_cnt.items():
+            if cnt != 1:
+                continue
+            t1, t2 = edge_dir[key]
+            b1 = [t1[0], t1[1], z_xy(t1[0], t1[1])]
+            b2 = [t2[0], t2[1], z_xy(t2[0], t2[1])]
+            tris.append((t2, t1, b1))
+            tris.append((t2, b1, b2))
 
         return tris
 
