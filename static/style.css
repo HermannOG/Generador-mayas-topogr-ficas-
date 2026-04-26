@@ -456,6 +456,36 @@ input[type="range"] {
 /* ── Leaflet override ── */
 .leaflet-container { font-family: inherit; }
 
+/* ── Quality selector ── */
+.quality-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.quality-btns { display: flex; gap: 4px; }
+
+.quality-btn {
+  padding: 4px 10px;
+  border: 1.5px solid #dde1e7;
+  border-radius: 5px;
+  background: #f8f9fa;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #555;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.quality-btn:hover { border-color: #00b4d8; }
+
+.quality-btn.active {
+  background: #00b4d8;
+  border-color: #00b4d8;
+  color: #fff;
+}
+
 /* ── Preview 3D button ── */
 .btn-preview {
   background: linear-gradient(135deg, #0077a8 0%, #00b4d8 100%);

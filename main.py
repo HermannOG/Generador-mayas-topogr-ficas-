@@ -151,7 +151,8 @@ async def preview_mesh_endpoint(
         raise HTTPException(400, "No se pueden calcular límites")
 
     lat_c, lon_c, size_km = _resolve_center(cfg, points, bounds)
-    resolution = 50   # preview – balance between speed and smooth edges
+    resolution = int(cfg.get("preview_quality", 50))
+    resolution = max(20, min(resolution, 100))  # clamp 20–100
 
     try:
         grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
