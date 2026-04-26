@@ -174,12 +174,33 @@ async def preview_mesh_endpoint(
     }
     tree_line_m = float(cfg.get("tree_line", 1250))
 
+    # ── Fetch water bodies ────────────────────────────────────────────────
+    water_data = None
+    if cfg.get("include_lakes") or cfg.get("include_rivers") or cfg.get("include_seas"):
+        try:
+            all_water = fetch_water_bodies(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
+            water_data = [
+                w for w in all_water
+                if (
+                    (w["type"] == "lake"  and cfg.get("include_lakes",  True))
+                    or (w["type"] == "sea"   and cfg.get("include_seas",   True))
+                    or (w["type"] == "river" and cfg.get("include_rivers", False))
+                )
+            ]
+        except Exception:
+            water_data = None
+
+    # For open seas/bays, SRTM returns ~0 m — use elevation threshold
+    detect_ocean_m = 0.5 if cfg.get("include_seas", True) else None
+
     try:
         gen = MeshGenerator(mesh_cfg)
         components = gen.generate_components_b64(
             grid, lat_b, lon_b,
             gpx_points=points,
             tree_line_m=tree_line_m,
+            water=water_data,
+            detect_ocean_m=detect_ocean_m,
         )
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -280,6 +301,7 @@ async def generate(
     }
 
     gen = MeshGenerator(mesh_cfg)
+    detect_ocean_m = 0.5 if cfg.get("include_seas", True) else None
 
     # ── Generate ──────────────────────────────────────────────────────────
     try:
@@ -287,6 +309,7 @@ async def generate(
             terrain_bytes = gen.generate_bytes(
                 grid, lat_b, lon_b,
                 buildings=buildings_data, water=water_data, gpx_points=None,
+                detect_ocean_m=detect_ocean_m,
             )
             trail_bytes = gen.generate_trail_only_bytes(grid, lat_b, lon_b, gpx_points=points)
 
@@ -305,6 +328,7 @@ async def generate(
             stl_bytes = gen.generate_bytes(
                 grid, lat_b, lon_b,
                 buildings=buildings_data, water=water_data, gpx_points=points,
+                detect_ocean_m=detect_ocean_m,
             )
             return StreamingResponse(
                 io.BytesIO(stl_bytes),

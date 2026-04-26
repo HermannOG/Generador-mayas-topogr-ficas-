@@ -35,27 +35,45 @@ class MeshGenerator:
 
     def generate_components_b64(self, elevation_grid, lat_bounds, lon_bounds,
                                  buildings=None, water=None, gpx_points=None,
-                                 tree_line_m=1250.0):
+                                 tree_line_m=1250.0, detect_ocean_m=None):
         """
         Generate the real STL geometry split into colour zones.
         Returns dict of base64-encoded binary STL strings:
-          {"land": str, "rock": str, "trail": str}
+          {"land": str, "rock": str, "trail": str, "water": str}
 
-        Triangles whose average Z is below the tree-line Z threshold go to
-        "land"; those above go to "rock".  Route ribbon goes to "trail".
+        detect_ocean_m: if not None, cells with original elevation <= this value
+          (metres) are treated as sea/ocean (SRTM returns ~0 for water bodies).
         """
         self._setup(elevation_grid, lat_bounds, lon_bounds)
-        grid = self._apply_water(elevation_grid, self._build_water_mask(elevation_grid, water))
+        water_mask = self._build_water_mask(elevation_grid, water,
+                                            detect_ocean_m=detect_ocean_m)
+        grid = self._apply_water(elevation_grid, water_mask)
 
         all_terrain = self._terrain(grid)
 
         # Z in model-space that corresponds to tree_line_m elevation
         tree_z = self.ele_to_z(tree_line_m)
 
-        land_tris, rock_tris = [], []
+        rows, cols = grid.shape
+
+        def _in_water(x, y):
+            if water_mask is None:
+                return False
+            j = int(round(x / self.model_w * (cols - 1)))
+            i = int(round((1.0 - y / self.model_h) * (rows - 1)))
+            i = max(0, min(rows - 1, i))
+            j = max(0, min(cols - 1, j))
+            return bool(water_mask[i, j])
+
+        land_tris, rock_tris, water_tris = [], [], []
         for tri in all_terrain:
-            avg_z = (tri[0][2] + tri[1][2] + tri[2][2]) / 3.0
-            (rock_tris if avg_z >= tree_z else land_tris).append(tri)
+            cx = (tri[0][0] + tri[1][0] + tri[2][0]) / 3.0
+            cy = (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0
+            if _in_water(cx, cy):
+                water_tris.append(tri)
+            else:
+                avg_z = (tri[0][2] + tri[1][2] + tri[2][2]) / 3.0
+                (rock_tris if avg_z >= tree_z else land_tris).append(tri)
 
         if buildings:
             land_tris.extend(self._buildings(buildings))
@@ -65,13 +83,21 @@ class MeshGenerator:
         def enc(tris):
             return base64.b64encode(self._to_stl(tris)).decode("ascii")
 
-        return {"land": enc(land_tris), "rock": enc(rock_tris), "trail": enc(route_tris)}
+        return {
+            "land":  enc(land_tris),
+            "rock":  enc(rock_tris),
+            "trail": enc(route_tris),
+            "water": enc(water_tris),
+        }
 
     def generate_bytes(self, elevation_grid, lat_bounds, lon_bounds,
-                       buildings=None, water=None, gpx_points=None):
+                       buildings=None, water=None, gpx_points=None,
+                       detect_ocean_m=None):
         """Full map: terrain + optional buildings + optional route."""
         self._setup(elevation_grid, lat_bounds, lon_bounds)
-        grid = self._apply_water(elevation_grid, self._build_water_mask(elevation_grid, water))
+        grid = self._apply_water(elevation_grid,
+                                 self._build_water_mask(elevation_grid, water,
+                                                        detect_ocean_m=detect_ocean_m))
         tris = []
         tris.extend(self._terrain(grid))
         if buildings:
@@ -161,29 +187,33 @@ class MeshGenerator:
 
     # ── Water ────────────────────────────────────────────────────────────
 
-    def _build_water_mask(self, grid, water_features):
-        if not water_features:
-            return None
-        polys = []
-        for w in water_features:
-            coords = w.get("coords", [])
-            if len(coords) >= 3:
-                try:
-                    # Shapely polygon expects (lon, lat) = (x, y)
-                    polys.append(Polygon([(c[1], c[0]) for c in coords]))
-                except Exception:
-                    pass
-        if not polys:
-            return None
-        water_union = unary_union(polys)
+    def _build_water_mask(self, grid, water_features, detect_ocean_m=None):
+        mask = None
 
-        rows, cols = grid.shape
-        mask = np.zeros((rows, cols), dtype=bool)
-        lat_arr = np.linspace(self.lat_max, self.lat_min, rows)
-        lon_arr = np.linspace(self.lon_min, self.lon_max, cols)
-        for i in range(rows):
-            for j in range(cols):
-                mask[i, j] = water_union.contains(Point(lon_arr[j], lat_arr[i]))
+        if water_features:
+            polys = []
+            for w in water_features:
+                coords = w.get("coords", [])
+                if len(coords) >= 3:
+                    try:
+                        polys.append(Polygon([(c[1], c[0]) for c in coords]))
+                    except Exception:
+                        pass
+            if polys:
+                water_union = unary_union(polys)
+                rows, cols = grid.shape
+                mask = np.zeros((rows, cols), dtype=bool)
+                lat_arr = np.linspace(self.lat_max, self.lat_min, rows)
+                lon_arr = np.linspace(self.lon_min, self.lon_max, cols)
+                for i in range(rows):
+                    for j in range(cols):
+                        mask[i, j] = water_union.contains(Point(lon_arr[j], lat_arr[i]))
+
+        # Elevation-based ocean detection: SRTM returns ~0 for open sea/bay
+        if detect_ocean_m is not None:
+            ocean = grid <= detect_ocean_m
+            mask = ocean if mask is None else (mask | ocean)
+
         return mask
 
     def _apply_water(self, grid, mask):

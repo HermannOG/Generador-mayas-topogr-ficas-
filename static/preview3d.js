@@ -101,11 +101,13 @@ function renderPreview(data) {
   const landColor  = s.land_color  ?? "#00cc00";
   const rockColor  = s.rock_color  ?? "#aaaaaa";
   const trailColor = s.trail_color ?? "#ff0000";
+  const waterColor = s.water_color ?? "#0055ff";
 
   const comps = data.components ?? {};
   const landMesh  = makeMesh(comps.land,  landColor);
   const rockMesh  = makeMesh(comps.rock,  rockColor);
   const trailMesh = makeMesh(comps.trail, trailColor);
+  const waterMesh = makeMesh(comps.water, waterColor);
 
   if (!landMesh && !rockMesh) {
     console.warn("Preview: no mesh data received");
@@ -115,6 +117,7 @@ function renderPreview(data) {
   geoGroup = new THREE.Group();
   if (landMesh)  geoGroup.add(landMesh);
   if (rockMesh)  geoGroup.add(rockMesh);
+  if (waterMesh) geoGroup.add(waterMesh);
   if (trailMesh) geoGroup.add(trailMesh);
 
   // Centre the model at origin
