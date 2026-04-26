@@ -1,10 +1,10 @@
 """
 3D mesh generator for topographic maps.
 
-Coordinate convention (model space, millimetres):
-  X  →  East  (longitude direction)
-  Y  →  North (latitude direction)
-  Z  →  Up    (elevation)
+Model-space coordinate system (millimetres):
+  X → East   (longitude direction)
+  Y → North  (latitude direction)
+  Z → Up     (elevation)
 """
 
 import io
@@ -13,37 +13,46 @@ import struct
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
 
 
 class MeshGenerator:
+
     def __init__(self, config=None):
         cfg = config or {}
-        self.target_size_mm   = cfg.get("target_size_mm",    150.0)
-        self.base_mm          = cfg.get("base_thickness_mm",   3.0)
-        self.max_ele_mm       = cfg.get("max_ele_height_mm",  20.0)
-        self.building_h_mm    = cfg.get("building_height_mm",  2.0)
-        self.route_width_mm   = cfg.get("route_width_mm",      1.0)
-        self.route_height_mm  = cfg.get("route_height_mm",     1.0)
+        self.target_size_mm  = cfg.get("target_size_mm",    100.0)
+        self.base_mm         = cfg.get("base_thickness_mm",   5.0)
+        self.max_ele_mm      = cfg.get("max_ele_height_mm",  20.0)
+        self.building_h_mm   = cfg.get("building_height_mm",  2.0)
+        self.route_width_mm  = cfg.get("route_width_mm",      1.0)
+        self.route_height_mm = cfg.get("route_height_mm",     1.0)
+        self.shape           = cfg.get("shape",            "square")
+        self.tree_line_m     = cfg.get("tree_line_m",        1250.0)
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ── Public API ────────────────────────────────────────────────────────
 
     def generate_bytes(self, elevation_grid, lat_bounds, lon_bounds,
-                       buildings=None, gpx_points=None):
-        """Return binary STL bytes ready for download."""
+                       buildings=None, water=None, gpx_points=None):
+        """Full map: terrain + optional buildings + optional route."""
         self._setup(elevation_grid, lat_bounds, lon_bounds)
-        triangles = []
-        triangles.extend(self._terrain(elevation_grid))
+        grid = self._apply_water(elevation_grid, self._build_water_mask(elevation_grid, water))
+        tris = []
+        tris.extend(self._terrain(grid))
         if buildings:
-            triangles.extend(self._buildings(buildings))
+            tris.extend(self._buildings(buildings))
         if gpx_points and len(gpx_points) >= 2:
-            triangles.extend(self._route(gpx_points))
-        return self._to_stl_bytes(triangles)
+            tris.extend(self._route(gpx_points))
+        return self._to_stl(tris)
 
-    # ------------------------------------------------------------------
-    # Coordinate transforms
-    # ------------------------------------------------------------------
+    def generate_trail_only_bytes(self, elevation_grid, lat_bounds, lon_bounds, gpx_points):
+        """Trail ribbon only (for separate-filament printing)."""
+        self._setup(elevation_grid, lat_bounds, lon_bounds)
+        if not gpx_points or len(gpx_points) < 2:
+            return self._to_stl([])
+        return self._to_stl(self._route(gpx_points))
+
+    # ── Coordinate setup ─────────────────────────────────────────────────
 
     def _setup(self, grid, lat_bounds, lon_bounds):
         rows, cols = grid.shape
@@ -55,17 +64,18 @@ class MeshGenerator:
         height_m = (lat_max - lat_min) * 111_000
         max_dim  = max(width_m, height_m)
 
-        self.sxy      = self.target_size_mm / max_dim
-        self.model_w  = width_m  * self.sxy
-        self.model_h  = height_m * self.sxy
+        self.sxy     = self.target_size_mm / max_dim
+        self.model_w = width_m  * self.sxy
+        self.model_h = height_m * self.sxy
 
-        self.ele_min  = float(np.nanmin(grid))
-        self.ele_max  = float(np.nanmax(grid))
-        ele_range     = max(self.ele_max - self.ele_min, 1.0)
-        self.sz       = self.max_ele_mm / ele_range
+        self.ele_min = float(np.nanmin(grid))
+        self.ele_max = float(np.nanmax(grid))
+        ele_range    = max(self.ele_max - self.ele_min, 1.0)
+        self.sz      = self.max_ele_mm / ele_range
 
         self.lat_min, self.lat_max = lat_min, lat_max
         self.lon_min, self.lon_max = lon_min, lon_max
+        self.rows, self.cols = rows, cols
 
         lat_arr = np.linspace(lat_max, lat_min, rows)
         lon_arr = np.linspace(lon_min, lon_max, cols)
@@ -74,74 +84,157 @@ class MeshGenerator:
             method="linear", bounds_error=False, fill_value=self.ele_min,
         )
 
+        cx, cy = self.model_w / 2, self.model_h / 2
+        r = min(cx, cy) * 0.98
+        self._shape_poly = self._make_shape(cx, cy, r)
+
+    def _make_shape(self, cx, cy, r):
+        s = self.shape
+        if s == "hexagon":
+            angles = [i * math.pi / 3 + math.pi / 6 for i in range(6)]
+            pts = [(cx + r * math.cos(a), cy + r * math.sin(a)) for a in angles]
+            return Polygon(pts)
+        elif s in ("circle", "circle-flat"):
+            return Point(cx, cy).buffer(r, resolution=64)
+        else:   # square / default
+            return Polygon([
+                (0, 0), (self.model_w, 0),
+                (self.model_w, self.model_h), (0, self.model_h),
+            ])
+
+    # ── Coordinate helpers ────────────────────────────────────────────────
+
     def ll_to_xy(self, lat, lon):
         x = (lon - self.lon_min) / (self.lon_max - self.lon_min) * self.model_w
         y = (lat - self.lat_min) / (self.lat_max - self.lat_min) * self.model_h
         return x, y
 
+    def _xy_to_ll(self, x, y):
+        lon = self.lon_min + x / self.model_w * (self.lon_max - self.lon_min)
+        lat = self.lat_min + y / self.model_h * (self.lat_max - self.lat_min)
+        return lat, lon
+
     def ele_to_z(self, ele):
         return (ele - self.ele_min) * self.sz + self.base_mm
 
     def z_at(self, lat, lon):
-        e = float(self._interp([[lat, lon]])[0])
-        return self.ele_to_z(e)
+        return self.ele_to_z(float(self._interp([[lat, lon]])[0]))
 
     def _in_bounds(self, lat, lon):
         return (self.lat_min <= lat <= self.lat_max and
                 self.lon_min <= lon <= self.lon_max)
 
-    # ------------------------------------------------------------------
-    # Terrain solid (watertight)
-    # ------------------------------------------------------------------
+    # ── Water ────────────────────────────────────────────────────────────
 
-    def _terrain(self, grid):
+    def _build_water_mask(self, grid, water_features):
+        if not water_features:
+            return None
+        polys = []
+        for w in water_features:
+            coords = w.get("coords", [])
+            if len(coords) >= 3:
+                try:
+                    # Shapely polygon expects (lon, lat) = (x, y)
+                    polys.append(Polygon([(c[1], c[0]) for c in coords]))
+                except Exception:
+                    pass
+        if not polys:
+            return None
+        water_union = unary_union(polys)
+
         rows, cols = grid.shape
-        V = np.empty((rows, cols, 3))
+        mask = np.zeros((rows, cols), dtype=bool)
+        lat_arr = np.linspace(self.lat_max, self.lat_min, rows)
+        lon_arr = np.linspace(self.lon_min, self.lon_max, cols)
+        for i in range(rows):
+            for j in range(cols):
+                mask[i, j] = water_union.contains(Point(lon_arr[j], lat_arr[i]))
+        return mask
+
+    def _apply_water(self, grid, mask):
+        if mask is None:
+            return grid
+        out = grid.copy()
+        out[mask] = self.ele_min   # flatten water areas to minimum elevation
+        return out
+
+    # ── Terrain solid ─────────────────────────────────────────────────────
+
+    def _terrain(self, elevation_grid):
+        rows, cols = elevation_grid.shape
+        V = np.zeros((rows, cols, 3))
+        inside = np.zeros((rows, cols), dtype=bool)
+
         for i in range(rows):
             for j in range(cols):
                 lat = self.lat_max - i * (self.lat_max - self.lat_min) / (rows - 1)
                 lon = self.lon_min + j * (self.lon_max - self.lon_min) / (cols - 1)
                 x, y = self.ll_to_xy(lat, lon)
-                V[i, j] = (x, y, self.ele_to_z(grid[i, j]))
+                V[i, j] = [x, y, self.ele_to_z(elevation_grid[i, j])]
+                inside[i, j] = self._shape_poly.contains(Point(x, y))
 
         tris = []
 
-        # Top surface
+        # Top surface – only full quads where all 4 corners are inside shape
         for i in range(rows - 1):
             for j in range(cols - 1):
-                a, b = V[i, j],   V[i,   j+1]
-                c, d = V[i+1, j], V[i+1, j+1]
-                tris.append((a, b, d))
-                tris.append((a, d, c))
+                if inside[i, j] and inside[i, j+1] and inside[i+1, j] and inside[i+1, j+1]:
+                    tris.append((V[i, j],   V[i, j+1], V[i+1, j+1]))
+                    tris.append((V[i, j],   V[i+1, j+1], V[i+1, j]))
 
-        # Bottom face (normal → −Z)
+        # Bottom face and side walls depend on shape type
+        if self.shape == "square":
+            self._add_square_base(tris, V, rows, cols)
+        else:
+            self._add_shaped_base(tris)
+
+        return tris
+
+    def _add_square_base(self, tris, V, rows, cols):
         w, h = self.model_w, self.model_h
-        bl = [[0, 0, 0], [w, 0, 0], [w, h, 0], [0, h, 0]]
-        tris.append((bl[0], bl[2], bl[1]))
-        tris.append((bl[0], bl[3], bl[2]))
+
+        # Bottom face (normal → −Z, CW from above)
+        tris.append(([0,0,0], [w,h,0], [w,0,0]))
+        tris.append(([0,0,0], [0,h,0], [w,h,0]))
 
         def wall(edge, flip):
             for k in range(len(edge) - 1):
-                t, tn = edge[k], edge[k + 1]
+                t, tn = edge[k], edge[k+1]
                 b  = [t[0],  t[1],  0.0]
                 bn = [tn[0], tn[1], 0.0]
                 if not flip:
-                    tris.append((list(t), b,  bn))
-                    tris.append((list(t), bn, list(tn)))
+                    tris.append((list(t),  b,  bn)); tris.append((list(t), bn, list(tn)))
                 else:
-                    tris.append((list(t), bn, b))
-                    tris.append((list(t), list(tn), bn))
+                    tris.append((list(t), bn,   b)); tris.append((list(t), list(tn), bn))
 
         wall([V[rows-1, j] for j in range(cols)], flip=False)   # south
         wall([V[0,      j] for j in range(cols)], flip=True)    # north
         wall([V[i,      0] for i in range(rows)], flip=True)    # west
         wall([V[i, cols-1] for i in range(rows)], flip=False)   # east
 
-        return tris
+    def _add_shaped_base(self, tris):
+        cx, cy = self.model_w / 2, self.model_h / 2
+        outline = list(self._shape_poly.exterior.coords)
 
-    # ------------------------------------------------------------------
-    # Buildings
-    # ------------------------------------------------------------------
+        # Bottom face (fan from centre, normal → −Z)
+        for k in range(len(outline) - 1):
+            p0 = [outline[k][0],   outline[k][1],   0]
+            p1 = [outline[k+1][0], outline[k+1][1], 0]
+            pc = [cx, cy, 0]
+            tris.append((pc, p1, p0))
+
+        # Side walls along shape boundary
+        for k in range(len(outline) - 1):
+            x0, y0 = outline[k]
+            x1, y1 = outline[k+1]
+            lat0, lon0 = self._xy_to_ll(x0, y0)
+            lat1, lon1 = self._xy_to_ll(x1, y1)
+            z0t = self.z_at(lat0, lon0)
+            z1t = self.z_at(lat1, lon1)
+            tris.append(([x0,y0,0],    [x0,y0,z0t], [x1,y1,z1t]))
+            tris.append(([x0,y0,0],    [x1,y1,z1t], [x1,y1,0]))
+
+    # ── Buildings ────────────────────────────────────────────────────────
 
     def _buildings(self, buildings):
         tris = []
@@ -149,37 +242,33 @@ class MeshGenerator:
             coords = bld.get("coords", [])
             if len(coords) < 3:
                 continue
-
             lats = [c[0] for c in coords]
             lons = [c[1] for c in coords]
             if (max(lats) < self.lat_min or min(lats) > self.lat_max or
                     max(lons) < self.lon_min or min(lons) > self.lon_max):
                 continue
 
-            xy    = [self.ll_to_xy(lat, lon) for lat, lon in coords]
-            sample = coords[:min(4, len(coords))]
-            base_z = np.mean([self.z_at(lat, lon) for lat, lon in sample])
+            xy = [self.ll_to_xy(lat, lon) for lat, lon in coords]
+            base_z = float(np.mean([self.z_at(lat, lon) for lat, lon in coords[:4]]))
             top_z  = base_z + self.building_h_mm
             n      = len(xy)
 
             for k in range(n):
                 x0, y0 = xy[k]
                 x1, y1 = xy[(k + 1) % n]
-                tris.append(([x0, y0, base_z], [x1, y1, top_z], [x1, y1, base_z]))
-                tris.append(([x0, y0, base_z], [x0, y0, top_z], [x1, y1, top_z]))
+                tris.append(([x0,y0,base_z], [x1,y1,top_z], [x1,y1,base_z]))
+                tris.append(([x0,y0,base_z], [x0,y0,top_z], [x1,y1,top_z]))
 
-            cx = sum(p[0] for p in xy) / n
-            cy = sum(p[1] for p in xy) / n
+            cx_ = sum(p[0] for p in xy) / n
+            cy_ = sum(p[1] for p in xy) / n
             for k in range(n):
                 x0, y0 = xy[k]
                 x1, y1 = xy[(k + 1) % n]
-                tris.append(([cx, cy, top_z], [x0, y0, top_z], [x1, y1, top_z]))
+                tris.append(([cx_,cy_,top_z], [x0,y0,top_z], [x1,y1,top_z]))
 
         return tris
 
-    # ------------------------------------------------------------------
-    # GPX route ribbon
-    # ------------------------------------------------------------------
+    # ── GPX route ribbon ─────────────────────────────────────────────────
 
     def _route(self, points):
         tris  = []
@@ -195,8 +284,10 @@ class MeshGenerator:
 
             x0, y0 = self.ll_to_xy(lat0, lon0)
             x1, y1 = self.ll_to_xy(lat1, lon1)
-            z0 = self.z_at(lat0, lon0) + raise_
-            z1 = self.z_at(lat1, lon1) + raise_
+            z0t = self.z_at(lat0, lon0) + raise_
+            z1t = self.z_at(lat1, lon1) + raise_
+            z0b = z0t - raise_
+            z1b = z1t - raise_
 
             dx, dy = x1 - x0, y1 - y0
             length = math.hypot(dx, dy)
@@ -205,50 +296,37 @@ class MeshGenerator:
 
             nx, ny = -dy / length * hw, dx / length * hw
 
-            p0l = [x0 + nx, y0 + ny, z0]
-            p0r = [x0 - nx, y0 - ny, z0]
-            p1l = [x1 + nx, y1 + ny, z1]
-            p1r = [x1 - nx, y1 - ny, z1]
+            p0l = [x0+nx, y0+ny, z0t];  p0r = [x0-nx, y0-ny, z0t]
+            p1l = [x1+nx, y1+ny, z1t];  p1r = [x1-nx, y1-ny, z1t]
+            p0lb = [x0+nx, y0+ny, z0b]; p0rb = [x0-nx, y0-ny, z0b]
+            p1lb = [x1+nx, y1+ny, z1b]; p1rb = [x1-nx, y1-ny, z1b]
 
-            # Top ribbon
-            tris.append((p0l, p1r, p0r))
-            tris.append((p0l, p1l, p1r))
-
-            # Side walls (so the ribbon has thickness)
-            base_z0 = self.z_at(lat0, lon0)
-            base_z1 = self.z_at(lat1, lon1)
-            p0lb = [x0 + nx, y0 + ny, base_z0]
-            p0rb = [x0 - nx, y0 - ny, base_z0]
-            p1lb = [x1 + nx, y1 + ny, base_z1]
-            p1rb = [x1 - nx, y1 - ny, base_z1]
-
-            tris.append((p0l,  p0lb, p1lb))
-            tris.append((p0l,  p1lb, p1l))
-            tris.append((p0rb, p0r,  p1r))
-            tris.append((p0rb, p1r,  p1rb))
+            # Top face
+            tris.append((p0l, p1r, p0r));  tris.append((p0l, p1l, p1r))
+            # Left wall
+            tris.append((p0l, p0lb, p1lb)); tris.append((p0l, p1lb, p1l))
+            # Right wall
+            tris.append((p0rb, p0r, p1r));  tris.append((p0rb, p1r, p1rb))
 
         return tris
 
-    # ------------------------------------------------------------------
-    # Binary STL serialisation
-    # ------------------------------------------------------------------
+    # ── Binary STL serialisation ─────────────────────────────────────────
 
     @staticmethod
-    def _normal(t):
-        a = np.subtract(t[1], t[0])
-        b = np.subtract(t[2], t[0])
+    def _normal(tri):
+        a = np.subtract(tri[1], tri[0])
+        b = np.subtract(tri[2], tri[0])
         n = np.cross(a, b)
-        length = np.linalg.norm(n)
-        return (n / length).astype(np.float32) if length > 1e-10 else np.zeros(3, np.float32)
+        L = np.linalg.norm(n)
+        return (n / L).astype(np.float32) if L > 1e-10 else np.zeros(3, np.float32)
 
-    def _to_stl_bytes(self, triangles):
+    def _to_stl(self, triangles):
         buf = io.BytesIO()
-        buf.write(b"\x00" * 80)                            # header
-        buf.write(struct.pack("<I", len(triangles)))       # triangle count
+        buf.write(b"\x00" * 80)
+        buf.write(struct.pack("<I", len(triangles)))
         for tri in triangles:
-            n = self._normal(tri)
-            buf.write(struct.pack("<3f", *n))
+            buf.write(struct.pack("<3f", *self._normal(tri)))
             for v in tri:
                 buf.write(struct.pack("<3f", float(v[0]), float(v[1]), float(v[2])))
-            buf.write(struct.pack("<H", 0))                # attribute byte count
+            buf.write(struct.pack("<H", 0))
         return buf.getvalue()

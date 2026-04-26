@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Topo Trail Generator</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- ── Navbar ── -->
+<nav class="navbar">
+  <span class="nav-brand">Topo Trail Generator</span>
+  <div class="nav-links">
+    <a href="#">Home</a>
+    <a href="#">Generate</a>
+  </div>
+</nav>
+
+<!-- ── App layout ── -->
+<div class="app-layout">
+
+  <!-- ════════ Main area ════════ -->
+  <div class="main-area">
+
+    <!-- Drop zone / map preview -->
+    <div class="drop-zone" id="dropZone">
+      <div class="drop-inner" id="dropInner">
+        <svg class="drop-icon" viewBox="0 0 64 64" fill="none" stroke="#00b4d8" stroke-width="3">
+          <path d="M32 8v32M20 28l12 12 12-12"/>
+          <rect x="8" y="44" width="48" height="12" rx="4"/>
+        </svg>
+        <p>Drag &amp; drop your .gpx files here, or click to select</p>
+      </div>
+      <div id="mapContainer" style="display:none; width:100%; height:100%;"></div>
+      <input type="file" id="fileInput" accept=".gpx" hidden />
+    </div>
+
+    <!-- Tile bar -->
+    <div class="tile-bar" id="tileBar">
+      <div class="tile tile-empty active" id="tile0" data-idx="0">
+        <span class="tile-label">Empty Tile</span>
+      </div>
+      <div class="tile tile-add" id="tileAdd" title="Add tile">+</div>
+    </div>
+
+  </div>
+
+  <!-- ════════ Settings panel ════════ -->
+  <div class="settings-panel" id="settingsPanel">
+
+    <!-- Water -->
+    <div class="section">
+      <h3 class="section-title">Water</h3>
+      <label class="cb-label"><input type="checkbox" id="incSeas" checked /> Include seas</label>
+      <label class="cb-label"><input type="checkbox" id="incLakes" checked /> Include lakes</label>
+      <label class="cb-label"><input type="checkbox" id="incRivers" /> Include rivers</label>
+    </div>
+
+    <!-- Single Filament Printer -->
+    <div class="section">
+      <h3 class="section-title">Single Filament Printer</h3>
+      <label class="cb-label">
+        <input type="checkbox" id="printSep" />
+        Print trail and map separately
+        <span class="info-icon" title="Generates two separate STL files: terrain.stl and trail.stl, to print in different filament colours.">ℹ</span>
+      </label>
+    </div>
+
+    <!-- Buildings -->
+    <div class="section">
+      <h3 class="section-title">Buildings</h3>
+      <label class="cb-label"><input type="checkbox" id="incBuildings" /> Include Buildings</label>
+    </div>
+
+    <!-- Add trail (secondary GPX drop) -->
+    <div class="section">
+      <h3 class="section-title">Add trail</h3>
+      <div class="drop-zone-sm" id="trailDrop">
+        <p>Drag &amp; drop your .gpx files here, or click to select</p>
+        <input type="file" id="trailInput" accept=".gpx" hidden />
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    <button class="btn btn-cyan w-full" id="applyAllBtn">Apply Settings to all Files</button>
+    <div class="btn-row">
+      <button class="btn btn-cyan" id="updateBtn">Update</button>
+      <button class="btn btn-dark" id="downloadBtn">Download</button>
+    </div>
+
+    <!-- Color -->
+    <div class="section">
+      <h3 class="section-title">Color</h3>
+
+      <p class="field-label">Water Color</p>
+      <div class="color-bar-wrap">
+        <div class="color-bar" id="waterColorBar" style="background:#0055ff;"></div>
+        <input type="color" id="waterColor" value="#0055ff" hidden />
+      </div>
+
+      <p class="field-label">Land Color</p>
+      <div class="color-bar-wrap">
+        <div class="color-bar" id="landColorBar" style="background:#00cc00;"></div>
+        <input type="color" id="landColor" value="#00cc00" hidden />
+      </div>
+
+      <p class="field-label">Rock Color</p>
+      <div class="color-bar-wrap">
+        <div class="color-bar" id="rockColorBar" style="background:#aaaaaa;"></div>
+        <input type="color" id="rockColor" value="#aaaaaa" hidden />
+      </div>
+
+      <p class="field-label">Trail Color</p>
+      <div class="color-bar-wrap">
+        <div class="color-bar" id="trailColorBar" style="background:#ff0000;"></div>
+        <input type="color" id="trailColor" value="#ff0000" hidden />
+      </div>
+    </div>
+
+    <!-- Trail settings -->
+    <div class="section">
+      <h3 class="section-title">Trail</h3>
+
+      <div class="field-row">
+        <label class="field-label">
+          Tree Line
+          <span class="info-icon" title="Elevation (metres) above which terrain is coloured as rock.">ℹ</span>
+        </label>
+        <input type="number" id="treeLine" class="num-input" value="1250" min="0" max="9000" />
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">
+            Height Scale
+            <span class="info-icon" title="Multiplier applied to the elevation exaggeration.">ℹ</span>
+          </label>
+          <span class="slider-val" id="heightScaleVal">1</span>
+        </div>
+        <input type="range" id="heightScale" min="0.1" max="5" step="0.1" value="1" />
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">Trail Width</label>
+          <span class="slider-val" id="trailWidthVal">1</span>
+        </div>
+        <input type="range" id="trailWidth" min="0.5" max="5" step="0.25" value="1" />
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">Trail Height</label>
+          <span class="slider-val" id="trailHeightVal">1</span>
+        </div>
+        <input type="range" id="trailHeight" min="0.5" max="5" step="0.25" value="1" />
+      </div>
+
+      <label class="cb-label">
+        <input type="checkbox" id="useGPXEle" />
+        Use elevation from GPX file
+        <span class="info-icon" title="Uses elevation data stored in the GPX instead of SRTM data.">ℹ</span>
+      </label>
+
+      <p class="field-label mt8">
+        Center on:
+        <span class="info-icon" title="Which point of the trail to centre the map on.">ℹ</span>
+      </p>
+      <div class="radio-group">
+        <label><input type="radio" name="centerOn" value="fit" checked /> Fit trail to view</label>
+        <label><input type="radio" name="centerOn" value="end" /> End of Trail</label>
+        <label><input type="radio" name="centerOn" value="start" /> Start of Trail</label>
+        <label><input type="radio" name="centerOn" value="highest" /> Highest Point</label>
+        <label><input type="radio" name="centerOn" value="furthest" /> Furthest from Start</label>
+      </div>
+    </div>
+
+    <!-- Shape -->
+    <div class="section">
+      <h3 class="section-title">Shape</h3>
+
+      <div class="shape-row">
+        <button class="shape-btn active" data-shape="hexagon" title="Hexagon">
+          <svg viewBox="0 0 36 36"><polygon points="18,2 32,10 32,26 18,34 4,26 4,10" fill="currentColor"/></svg>
+        </button>
+        <button class="shape-btn" data-shape="square" title="Square">
+          <svg viewBox="0 0 36 36"><rect x="4" y="4" width="28" height="28" fill="currentColor"/></svg>
+        </button>
+        <button class="shape-btn" data-shape="circle" title="Circle">
+          <svg viewBox="0 0 36 36"><circle cx="18" cy="18" r="15" fill="currentColor"/></svg>
+        </button>
+        <button class="shape-btn" data-shape="circle-flat" title="Circle (flat top)">
+          <svg viewBox="0 0 36 36"><circle cx="18" cy="18" r="15" fill="currentColor"/></svg>
+        </button>
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">
+            Base Thickness
+            <span class="info-icon" title="Thickness of the solid base plate in mm.">ℹ</span>
+          </label>
+          <span class="slider-val" id="baseThicknessVal">5</span>
+        </div>
+        <input type="range" id="baseThickness" min="1" max="15" step="0.5" value="5" />
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">
+            Distance Trail to Border
+            <span class="info-icon" title="Margin between the trail and the model border in mm.">ℹ</span>
+          </label>
+          <span class="slider-val" id="trailBorderVal">0.25</span>
+        </div>
+        <input type="range" id="trailBorder" min="0" max="5" step="0.25" value="0.25" />
+      </div>
+
+      <div class="slider-group">
+        <div class="slider-header">
+          <label class="field-label">
+            Base size
+            <span class="info-icon" title="Longest dimension of the model in mm.">ℹ</span>
+          </label>
+          <span class="slider-val" id="baseSizeVal">100</span>
+        </div>
+        <input type="range" id="baseSize" min="50" max="300" step="5" value="100" />
+      </div>
+
+      <label class="cb-label">
+        <input type="checkbox" id="highRes" />
+        Higher Resolution (takes twice as long)
+      </label>
+    </div>
+
+    <div class="footer-note">
+      Elevation: <a href="https://www.opentopodata.org/" target="_blank">OpenTopoData</a> (SRTM 90 m) ·
+      Map: <a href="https://www.openstreetmap.org/" target="_blank">OpenStreetMap</a>
+    </div>
+
+  </div><!-- /settings-panel -->
+</div><!-- /app-layout -->
+
+<!-- ── Loading overlay ── -->
+<div class="loading-overlay" id="loadingOverlay" hidden>
+  <div class="loading-card">
+    <div class="spinner"></div>
+    <p class="loading-title" id="loadingTitle">Generating your 3D map…</p>
+    <p class="loading-sub" id="loadingSub">Downloading elevation data (may take 30 – 120 s)</p>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

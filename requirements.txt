@@ -1,4 +1,6 @@
-streamlit>=1.28.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
 numpy>=1.24.0
 scipy>=1.11.0
 requests>=2.31.0
@@ -6,4 +8,3 @@ gpxpy>=1.6.0
 shapely>=2.0.0
 overpy>=0.7
 numpy-stl>=3.0.0
-plotly>=5.0.0
