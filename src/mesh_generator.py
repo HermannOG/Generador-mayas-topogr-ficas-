@@ -208,47 +208,54 @@ class MeshGenerator:
                 V[i, j] = [x, y, self.ele_to_z(elevation_grid[i, j])]
                 inside[i, j] = self._shape_poly.contains(Point(x, y))
 
+        def fq(i, j):
+            return (0 <= i < rows-1 and 0 <= j < cols-1 and
+                    bool(inside[i,j]) and bool(inside[i,j+1]) and
+                    bool(inside[i+1,j]) and bool(inside[i+1,j+1]))
+
         tris = []
 
-        # Top surface – full quads inside shape; boundary quads clipped against shape
         for i in range(rows - 1):
             for j in range(cols - 1):
-                n_in = (inside[i,j] + inside[i,j+1] + inside[i+1,j+1] + inside[i+1,j])
-                if n_in == 0:
+                if not fq(i, j):
                     continue
-                if n_in == 4:
-                    tris.append((V[i,j], V[i,j+1], V[i+1,j+1]))
-                    tris.append((V[i,j], V[i+1,j+1], V[i+1,j]))
-                else:
-                    # Clip the quad polygon against the shape boundary
-                    quad_poly = Polygon([
-                        (V[i,j][0],     V[i,j][1]),
-                        (V[i,j+1][0],   V[i,j+1][1]),
-                        (V[i+1,j+1][0], V[i+1,j+1][1]),
-                        (V[i+1,j][0],   V[i+1,j][1]),
-                    ])
-                    clipped = self._shape_poly.intersection(quad_poly)
-                    if clipped.is_empty:
-                        continue
-                    geoms = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
-                    for geom in geoms:
-                        if geom.geom_type != "Polygon" or geom.is_empty:
-                            continue
-                        pts2d = list(geom.exterior.coords[:-1])
-                        if len(pts2d) < 3:
-                            continue
-                        verts = []
-                        for px, py in pts2d:
-                            lat, lon = self._xy_to_ll(px, py)
-                            verts.append([px, py, self.z_at(lat, lon)])
-                        for k in range(1, len(verts) - 1):
-                            tris.append((verts[0], verts[k], verts[k+1]))
 
-        # Bottom face and side walls depend on shape type
-        if self.shape == "square":
-            self._add_square_base(tris, V, rows, cols)
-        else:
-            self._add_shaped_base(tris)
+                v00 = V[i,   j  ].tolist()  # NW
+                v01 = V[i,   j+1].tolist()  # NE
+                v10 = V[i+1, j  ].tolist()  # SW
+                v11 = V[i+1, j+1].tolist()  # SE
+                b00 = [v00[0], v00[1], 0.0]
+                b01 = [v01[0], v01[1], 0.0]
+                b10 = [v10[0], v10[1], 0.0]
+                b11 = [v11[0], v11[1], 0.0]
+
+                # Top face (normal +Z)
+                tris.append((v00, v11, v01))
+                tris.append((v00, v10, v11))
+
+                # Bottom face (normal -Z)
+                tris.append((b00, b01, b11))
+                tris.append((b00, b11, b10))
+
+                # North wall (+Y) – exposed if no full quad above
+                if not fq(i-1, j):
+                    tris.append((v00, v01, b01))
+                    tris.append((v00, b01, b00))
+
+                # South wall (-Y) – exposed if no full quad below
+                if not fq(i+1, j):
+                    tris.append((v11, v10, b10))
+                    tris.append((v11, b10, b11))
+
+                # West wall (-X) – exposed if no full quad to the left
+                if not fq(i, j-1):
+                    tris.append((v10, v00, b10))
+                    tris.append((v00, b00, b10))
+
+                # East wall (+X) – exposed if no full quad to the right
+                if not fq(i, j+1):
+                    tris.append((v01, v11, b11))
+                    tris.append((v01, b11, b01))
 
         return tris
 
