@@ -268,7 +268,7 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     fd.append("gpx_file", tile.gpxFile);
     fd.append("settings", JSON.stringify(collectSettings()));
 
-    const resp = await fetch("/api/preview", { method: "POST", body: fd });
+    const resp = await fetch("/api/preview-mesh", { method: "POST", body: fd });
     if (!resp.ok) {
       let msg = `Error ${resp.status}`;
       try { msg = (await resp.json()).detail ?? msg; } catch (_) {}
@@ -283,9 +283,8 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
     // Update stats bar
     const stats = document.getElementById("previewStats");
     if (stats) {
-      const pts = data.gpx_points?.length ?? 0;
       stats.textContent =
-        `Elevación: ${data.ele_min.toFixed(0)} m – ${data.ele_max.toFixed(0)} m  ·  ${pts} puntos GPX`;
+        `Elevación: ${data.ele_min.toFixed(0)} m – ${data.ele_max.toFixed(0)} m  ·  ${data.gpx_count} puntos GPX`;
     }
 
     window.Preview3D.render(data);

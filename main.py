@@ -126,6 +126,79 @@ async def preview_endpoint(
     })
 
 
+# ── Preview-mesh endpoint (real STL geometry, split by colour zone) ───────────
+@app.post("/api/preview-mesh")
+async def preview_mesh_endpoint(
+    gpx_file: UploadFile = File(...),
+    settings: str = Form("{}"),
+):
+    """
+    Returns base64-encoded binary STL for each colour zone (land/rock/trail).
+    Uses the same MeshGenerator as /api/generate, just at lower resolution.
+    """
+    cfg = json.loads(settings)
+    content = await gpx_file.read()
+
+    try:
+        points = parse_gpx(content)
+    except Exception as exc:
+        raise HTTPException(400, f"GPX inválido: {exc}")
+    if not points:
+        raise HTTPException(400, "No se encontraron puntos")
+
+    bounds = get_gpx_bounds(points)
+    if not bounds:
+        raise HTTPException(400, "No se pueden calcular límites")
+
+    lat_c, lon_c, size_km = _resolve_center(cfg, points, bounds)
+    resolution = 30   # fast preview – same mesh code, lower density
+
+    try:
+        grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
+    except Exception as exc:
+        raise HTTPException(500, f"Error descargando elevación: {exc}")
+
+    cache_id = _cache_store(grid, lat_b, lon_b)
+
+    height_scale = max(0.1, float(cfg.get("height_scale", 1.0)))
+    mesh_cfg = {
+        "target_size_mm":    float(cfg.get("base_size",       100)),
+        "base_thickness_mm": float(cfg.get("base_thickness",    5.0)),
+        "max_ele_height_mm": 20.0 * height_scale,
+        "building_height_mm": 2.0,
+        "route_width_mm":    float(cfg.get("trail_width",      1.0)),
+        "route_height_mm":   float(cfg.get("trail_height",     1.0)),
+        "shape":             cfg.get("shape", "square"),
+    }
+    tree_line_m = float(cfg.get("tree_line", 1250))
+
+    try:
+        gen = MeshGenerator(mesh_cfg)
+        components = gen.generate_components_b64(
+            grid, lat_b, lon_b,
+            gpx_points=points,
+            tree_line_m=tree_line_m,
+        )
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Error generando malla: {exc}")
+
+    return JSONResponse({
+        "cache_id":   cache_id,
+        "components": components,
+        "ele_min":    float(grid.min()),
+        "ele_max":    float(grid.max()),
+        "gpx_count":  len(points),
+        "settings": {
+            "land_color":  cfg.get("land_color",  "#00cc00"),
+            "rock_color":  cfg.get("rock_color",  "#aaaaaa"),
+            "water_color": cfg.get("water_color", "#0055ff"),
+            "trail_color": cfg.get("trail_color", "#ff0000"),
+            "tree_line":   tree_line_m,
+        },
+    })
+
+
 # ── Generate endpoint ─────────────────────────────────────────────────────────
 @app.post("/api/generate")
 async def generate(

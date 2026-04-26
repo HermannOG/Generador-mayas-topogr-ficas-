@@ -7,6 +7,7 @@ Model-space coordinate system (millimetres):
   Z → Up     (elevation)
 """
 
+import base64
 import io
 import math
 import struct
@@ -31,6 +32,40 @@ class MeshGenerator:
         self.tree_line_m     = cfg.get("tree_line_m",        1250.0)
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    def generate_components_b64(self, elevation_grid, lat_bounds, lon_bounds,
+                                 buildings=None, water=None, gpx_points=None,
+                                 tree_line_m=1250.0):
+        """
+        Generate the real STL geometry split into colour zones.
+        Returns dict of base64-encoded binary STL strings:
+          {"land": str, "rock": str, "trail": str}
+
+        Triangles whose average Z is below the tree-line Z threshold go to
+        "land"; those above go to "rock".  Route ribbon goes to "trail".
+        """
+        self._setup(elevation_grid, lat_bounds, lon_bounds)
+        grid = self._apply_water(elevation_grid, self._build_water_mask(elevation_grid, water))
+
+        all_terrain = self._terrain(grid)
+
+        # Z in model-space that corresponds to tree_line_m elevation
+        tree_z = self.ele_to_z(tree_line_m)
+
+        land_tris, rock_tris = [], []
+        for tri in all_terrain:
+            avg_z = (tri[0][2] + tri[1][2] + tri[2][2]) / 3.0
+            (rock_tris if avg_z >= tree_z else land_tris).append(tri)
+
+        if buildings:
+            land_tris.extend(self._buildings(buildings))
+
+        route_tris = self._route(gpx_points) if gpx_points and len(gpx_points) >= 2 else []
+
+        def enc(tris):
+            return base64.b64encode(self._to_stl(tris)).decode("ascii")
+
+        return {"land": enc(land_tris), "rock": enc(rock_tris), "trail": enc(route_tris)}
 
     def generate_bytes(self, elevation_grid, lat_bounds, lon_bounds,
                        buildings=None, water=None, gpx_points=None):
