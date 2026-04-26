@@ -330,42 +330,71 @@ class MeshGenerator:
     # ── GPX route ribbon ─────────────────────────────────────────────────
 
     def _route(self, points):
-        tris  = []
-        hw    = self.route_width_mm / 2.0
+        hw     = self.route_width_mm / 2.0
         raise_ = self.route_height_mm
 
-        for i in range(len(points) - 1):
-            lat0, lon0 = points[i][0],   points[i][1]
-            lat1, lon1 = points[i+1][0], points[i+1][1]
-
-            if not (self._in_bounds(lat0, lon0) or self._in_bounds(lat1, lon1)):
+        # Convert to model space; decimate so consecutive points are at
+        # least hw apart (eliminates GPS-jitter spikes at sharp joints)
+        mpts = []
+        for p in points:
+            lat, lon = p[0], p[1]
+            if not self._in_bounds(lat, lon):
                 continue
-
-            x0, y0 = self.ll_to_xy(lat0, lon0)
-            x1, y1 = self.ll_to_xy(lat1, lon1)
-            z0t = self.z_at(lat0, lon0) + raise_
-            z1t = self.z_at(lat1, lon1) + raise_
-            z0b = z0t - raise_
-            z1b = z1t - raise_
-
-            dx, dy = x1 - x0, y1 - y0
-            length = math.hypot(dx, dy)
-            if length < 1e-6:
+            x, y = self.ll_to_xy(lat, lon)
+            if mpts and math.hypot(x - mpts[-1][0], y - mpts[-1][1]) < hw:
                 continue
+            mpts.append([x, y, self.z_at(lat, lon)])
 
-            nx, ny = -dy / length * hw, dx / length * hw
+        n = len(mpts)
+        if n < 2:
+            return []
 
-            p0l = [x0+nx, y0+ny, z0t];  p0r = [x0-nx, y0-ny, z0t]
-            p1l = [x1+nx, y1+ny, z1t];  p1r = [x1-nx, y1-ny, z1t]
-            p0lb = [x0+nx, y0+ny, z0b]; p0rb = [x0-nx, y0-ny, z0b]
-            p1lb = [x1+nx, y1+ny, z1b]; p1rb = [x1-nx, y1-ny, z1b]
+        # Per-segment unit perpendicular (left-pointing)
+        perps = []
+        for i in range(n - 1):
+            dx, dy = mpts[i+1][0] - mpts[i][0], mpts[i+1][1] - mpts[i][1]
+            L = math.hypot(dx, dy) or 1e-9
+            perps.append((-dy / L, dx / L))
 
-            # Top face
-            tris.append((p0l, p1r, p0r));  tris.append((p0l, p1l, p1r))
+        # Per-vertex miter offset (capped at 3× to handle sharp corners)
+        def _miter(a, b):
+            mx, my = (a[0]+b[0]) * 0.5, (a[1]+b[1]) * 0.5
+            L = math.hypot(mx, my) or 1e-9
+            s = min(1.0 / L, 3.0)
+            return mx * s, my * s
+
+        offs = []
+        for i in range(n):
+            if   i == 0:     offs.append(perps[0])
+            elif i == n - 1: offs.append(perps[-1])
+            else:            offs.append(_miter(perps[i-1], perps[i]))
+
+        # Build 3-D vertex arrays
+        Lv, Rv, Lb, Rb = [], [], [], []
+        for i in range(n):
+            ox, oy = offs[i][0] * hw, offs[i][1] * hw
+            x, y, z = mpts[i]
+            Lv.append([x+ox, y+oy, z+raise_])
+            Rv.append([x-ox, y-oy, z+raise_])
+            Lb.append([x+ox, y+oy, z])
+            Rb.append([x-ox, y-oy, z])
+
+        tris = []
+        for i in range(n - 1):
+            l0,r0,lb0,rb0 = Lv[i],   Rv[i],   Lb[i],   Rb[i]
+            l1,r1,lb1,rb1 = Lv[i+1], Rv[i+1], Lb[i+1], Rb[i+1]
+            # Top
+            tris.append((l0, r0, r1)); tris.append((l0, r1, l1))
+            # Bottom
+            tris.append((lb0, rb1, rb0)); tris.append((lb0, lb1, rb1))
             # Left wall
-            tris.append((p0l, p0lb, p1lb)); tris.append((p0l, p1lb, p1l))
+            tris.append((l0, l1, lb1)); tris.append((l0, lb1, lb0))
             # Right wall
-            tris.append((p0rb, p0r, p1r));  tris.append((p0rb, p1r, p1rb))
+            tris.append((r0, rb0, rb1)); tris.append((r0, rb1, r1))
+
+        # End caps (close the ribbon into a watertight solid)
+        tris.append((Lv[0],  Lb[0],  Rb[0]));  tris.append((Lv[0],  Rb[0],  Rv[0]))
+        tris.append((Lv[-1], Rv[-1], Rb[-1])); tris.append((Lv[-1], Rb[-1], Lb[-1]))
 
         return tris
 
