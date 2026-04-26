@@ -238,10 +238,12 @@
         <input type="range" id="baseSize" min="50" max="300" step="5" value="100" />
       </div>
 
-      <label class="cb-label">
-        <input type="checkbox" id="highRes" />
-        Higher Resolution (takes twice as long)
-      </label>
+      <p class="field-label mt8">Calidad del STL:</p>
+      <div class="radio-group">
+        <label><input type="radio" name="stlQuality" value="standard" checked /> Estándar &nbsp;<span style="color:#999;font-size:0.78rem;">(~30 s)</span></label>
+        <label><input type="radio" name="stlQuality" value="high" /> Alta &nbsp;<span style="color:#999;font-size:0.78rem;">(~70 s, 4× más polígonos)</span></label>
+        <label><input type="radio" name="stlQuality" value="ultra" /> Ultra &nbsp;<span style="color:#999;font-size:0.78rem;">(~2–4 min, 9× más polígonos)</span></label>
+      </div>
     </div>
 
     <div class="footer-note">

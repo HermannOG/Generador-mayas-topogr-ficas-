@@ -225,7 +225,9 @@ async def generate(
     lat_c, lon_c, _ = _resolve_center(cfg, points, bounds)
 
     size_km = bounds["size_km"]
-    resolution = 80 if cfg.get("high_resolution", False) else 50
+    resolution = {"standard": 50, "high": 100, "ultra": 150}.get(
+        cfg.get("stl_quality", "standard"), 50
+    )
 
     # ── Fetch elevation (reuse cached preview grid if available) ──────────
     cache_id = cfg.get("cache_id")

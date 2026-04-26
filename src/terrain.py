@@ -15,7 +15,7 @@ def fetch_elevation_grid(lat_center, lon_center, size_km, resolution=50):
         lat_bounds     : (lat_min, lat_max)
         lon_bounds     : (lon_min, lon_max)
     """
-    resolution = max(10, min(resolution, 100))
+    resolution = max(10, min(resolution, 200))
 
     lat_delta = (size_km / 2.0) / 111.0
     lon_delta = (size_km / 2.0) / (111.0 * math.cos(math.radians(lat_center)))

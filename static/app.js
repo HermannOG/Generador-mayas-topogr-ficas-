@@ -246,7 +246,7 @@ function collectSettings() {
     base_thickness:    parseFloat(document.getElementById("baseThickness")?.value ?? 5),
     trail_border:      parseFloat(document.getElementById("trailBorder")?.value  ?? 0.25),
     base_size:         parseFloat(document.getElementById("baseSize")?.value     ?? 100),
-    high_resolution:   document.getElementById("highRes")?.checked   ?? false,
+    stl_quality:       document.querySelector("input[name='stlQuality']:checked")?.value ?? "standard",
     cache_id:          tiles[activeTileIdx]?.cacheId ?? null,
   };
 }
@@ -314,9 +314,11 @@ async function generateSTL() {
 
   const settings = collectSettings();
 
+  const qualityLabels = { standard: "~30 s", high: "~70 s", ultra: "2–4 min" };
+  const qLabel = qualityLabels[settings.stl_quality] ?? "30–120 s";
   loadingOverlay.hidden = false;
   loadingTitle.textContent = "Generando tu mapa 3D…";
-  loadingSub.textContent   = "Descargando datos de elevación (puede tardar 30–120 s)";
+  loadingSub.textContent   = `Descargando datos de elevación (puede tardar ${qLabel})`;
 
   try {
     const fd = new FormData();
