@@ -210,12 +210,39 @@ class MeshGenerator:
 
         tris = []
 
-        # Top surface – only full quads where all 4 corners are inside shape
+        # Top surface – full quads inside shape; boundary quads clipped against shape
         for i in range(rows - 1):
             for j in range(cols - 1):
-                if inside[i, j] and inside[i, j+1] and inside[i+1, j] and inside[i+1, j+1]:
-                    tris.append((V[i, j],   V[i, j+1], V[i+1, j+1]))
-                    tris.append((V[i, j],   V[i+1, j+1], V[i+1, j]))
+                n_in = (inside[i,j] + inside[i,j+1] + inside[i+1,j+1] + inside[i+1,j])
+                if n_in == 0:
+                    continue
+                if n_in == 4:
+                    tris.append((V[i,j], V[i,j+1], V[i+1,j+1]))
+                    tris.append((V[i,j], V[i+1,j+1], V[i+1,j]))
+                else:
+                    # Clip the quad polygon against the shape boundary
+                    quad_poly = Polygon([
+                        (V[i,j][0],     V[i,j][1]),
+                        (V[i,j+1][0],   V[i,j+1][1]),
+                        (V[i+1,j+1][0], V[i+1,j+1][1]),
+                        (V[i+1,j][0],   V[i+1,j][1]),
+                    ])
+                    clipped = self._shape_poly.intersection(quad_poly)
+                    if clipped.is_empty:
+                        continue
+                    geoms = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
+                    for geom in geoms:
+                        if geom.geom_type != "Polygon" or geom.is_empty:
+                            continue
+                        pts2d = list(geom.exterior.coords[:-1])
+                        if len(pts2d) < 3:
+                            continue
+                        verts = []
+                        for px, py in pts2d:
+                            lat, lon = self._xy_to_ll(px, py)
+                            verts.append([px, py, self.z_at(lat, lon)])
+                        for k in range(1, len(verts) - 1):
+                            tris.append((verts[0], verts[k], verts[k+1]))
 
         # Bottom face and side walls depend on shape type
         if self.shape == "square":
