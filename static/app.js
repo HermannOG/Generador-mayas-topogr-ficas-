@@ -261,12 +261,14 @@ document.getElementById("previewBtn").addEventListener("click", async () => {
 
   const btn = document.getElementById("previewBtn");
   btn.disabled = true;
-  btn.textContent = "⏳ Cargando elevaciones…";
+  const settings = collectSettings();
+  const previewTimes = { standard: "~30 s", high: "~70 s", ultra: "~2–4 min" };
+  btn.textContent = `⏳ Cargando (${previewTimes[settings.stl_quality] ?? "~30 s"})…`;
 
   try {
     const fd = new FormData();
     fd.append("gpx_file", tile.gpxFile);
-    fd.append("settings", JSON.stringify(collectSettings()));
+    fd.append("settings", JSON.stringify(settings));
 
     const resp = await fetch("/api/preview-mesh", { method: "POST", body: fd });
     if (!resp.ok) {

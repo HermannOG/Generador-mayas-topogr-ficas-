@@ -352,8 +352,11 @@ class MeshGenerator:
             lat, lon = self._xy_to_ll(x, y)
             return self.z_at(lat, lon)
 
+        # Simplify before buffering to remove GPS-noise zigzags
+        path = LineString(pts2d).simplify(hw * 0.8, preserve_topology=True)
+
         # Buffer the 2D path → smooth ribbon (round joins, flat end caps)
-        ribbon = LineString(pts2d).buffer(hw, cap_style=2, join_style=1, resolution=8)
+        ribbon = path.buffer(hw, cap_style=2, join_style=1, resolution=8)
         if ribbon.is_empty:
             return []
 
