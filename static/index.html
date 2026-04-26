@@ -6,6 +6,14 @@
   <title>Topo Trail Generator</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="/static/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three":          "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
 </head>
 <body>
 
@@ -89,6 +97,7 @@
       <button class="btn btn-cyan" id="updateBtn">Update</button>
       <button class="btn btn-dark" id="downloadBtn">Download</button>
     </div>
+    <button class="btn btn-preview w-full" id="previewBtn">&#x1F3D4; Preview 3D</button>
 
     <!-- Color -->
     <div class="section">
@@ -252,7 +261,34 @@
   </div>
 </div>
 
+<!-- ── 3D Preview Modal ── -->
+<div class="preview-modal" id="previewModal" hidden>
+  <div class="preview-overlay-bg" id="previewBg"></div>
+  <div class="preview-container">
+
+    <div class="preview-header">
+      <h2 class="preview-title">&#x1F3D4; Vista 3D del Mapa</h2>
+      <div class="preview-header-actions">
+        <button class="preview-pill" id="wireframeToggle">&#x2B21; Wireframe</button>
+        <button class="preview-close" id="closePreview" title="Cerrar (Esc)">&#x2715;</button>
+      </div>
+    </div>
+
+    <canvas id="previewCanvas" class="preview-canvas"></canvas>
+
+    <div class="preview-footer">
+      <span class="preview-hint">
+        &#x1F5B1; Arrastrar: Rotar &nbsp;&middot;&nbsp; Scroll: Zoom &nbsp;&middot;&nbsp; Clic Der: Mover
+      </span>
+      <span class="preview-stats" id="previewStats"></span>
+      <button class="btn btn-dark preview-dl-btn" id="downloadFromPreview">&#x2B07; Descargar STL</button>
+    </div>
+
+  </div>
+</div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/static/app.js"></script>
+<script type="module" src="/static/preview3d.js"></script>
 </body>
 </html>

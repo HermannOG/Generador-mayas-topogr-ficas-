@@ -247,8 +247,63 @@ function collectSettings() {
     trail_border:      parseFloat(document.getElementById("trailBorder")?.value  ?? 0.25),
     base_size:         parseFloat(document.getElementById("baseSize")?.value     ?? 100),
     high_resolution:   document.getElementById("highRes")?.checked   ?? false,
+    cache_id:          tiles[activeTileIdx]?.cacheId ?? null,
   };
 }
+
+// ── Preview 3D ─────────────────────────────────────────────────────────────
+document.getElementById("previewBtn").addEventListener("click", async () => {
+  const tile = tiles[activeTileIdx];
+  if (!tile?.gpxFile) {
+    alert("Por favor, carga un archivo GPX primero.");
+    return;
+  }
+
+  const btn = document.getElementById("previewBtn");
+  btn.disabled = true;
+  btn.textContent = "⏳ Cargando elevaciones…";
+
+  try {
+    const fd = new FormData();
+    fd.append("gpx_file", tile.gpxFile);
+    fd.append("settings", JSON.stringify(collectSettings()));
+
+    const resp = await fetch("/api/preview", { method: "POST", body: fd });
+    if (!resp.ok) {
+      let msg = `Error ${resp.status}`;
+      try { msg = (await resp.json()).detail ?? msg; } catch (_) {}
+      throw new Error(msg);
+    }
+
+    const data = await resp.json();
+
+    // Cache the elevation ID so Download can skip re-fetching
+    tile.cacheId = data.cache_id;
+
+    // Update stats bar
+    const stats = document.getElementById("previewStats");
+    if (stats) {
+      const pts = data.gpx_points?.length ?? 0;
+      stats.textContent =
+        `Elevación: ${data.ele_min.toFixed(0)} m – ${data.ele_max.toFixed(0)} m  ·  ${pts} puntos GPX`;
+    }
+
+    window.Preview3D.render(data);
+    window.Preview3D.show();
+
+  } catch (err) {
+    alert("Error en la vista previa:\n" + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🏔️ Preview 3D";
+  }
+});
+
+// ── Download from inside the preview modal ─────────────────────────────────
+document.getElementById("downloadFromPreview").addEventListener("click", () => {
+  window.Preview3D.hide();
+  generateSTL();
+});
 
 // ── Generate & download ────────────────────────────────────────────────────
 async function generateSTL() {
