@@ -82,6 +82,7 @@ function makeMesh(b64, colorHex) {
     color:     new THREE.Color(colorHex),
     shininess: 12,
     specular:  new THREE.Color(0x111111),
+    side:      THREE.DoubleSide,
   });
   const mesh = new THREE.Mesh(geom, mat);
   mesh.castShadow    = true;
