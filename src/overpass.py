@@ -3,9 +3,14 @@ Minimal Overpass API client.
 
 overpass-api.de rejects requests without a real User-Agent (HTTP 406),
 which overpy does not set — so we talk to the interpreter directly.
+Responses are cached on disk (keyed by query) so re-generating the same
+area doesn't re-download map features.
 """
 
+import hashlib
+import json
 import time
+from pathlib import Path
 
 import requests
 
@@ -16,9 +21,19 @@ OVERPASS_URLS = [
 ]
 USER_AGENT = "TopoTrail/1.0 (github.com/topotrail; 3D-print map generator)"
 
+CACHE_DIR = Path("generated") / "overpass"
+CACHE_TTL_S = 24 * 3600
+
 
 def query_overpass(query, retries=4):
-    """POST an Overpass QL query, return decoded JSON. Raises on failure."""
+    """POST an Overpass QL query, return decoded JSON (disk-cached, 24 h)."""
+    cache_path = CACHE_DIR / f"{hashlib.sha256(query.encode()).hexdigest()}.json"
+    if cache_path.exists() and time.time() - cache_path.stat().st_mtime < CACHE_TTL_S:
+        try:
+            return json.loads(cache_path.read_text())
+        except Exception:
+            pass  # corrupt cache entry — refetch
+
     last_exc = None
     for attempt in range(retries):
         url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
@@ -30,7 +45,10 @@ def query_overpass(query, retries=4):
                 timeout=90,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(data))
+            return data
         except Exception as exc:
             last_exc = exc
             if attempt < retries - 1:

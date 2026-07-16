@@ -143,7 +143,8 @@ def _cleanup_old_jobs():
             shutil.rmtree(d, ignore_errors=True)
 
 
-def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
+def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
+                  terrain_only: bool = False):
     """
     Blocking generation pipeline: elevation → water/buildings → meshes → assets.
     trails: list of {"points": [(lat, lon, ele)...], "flat": bool} per GPX file
@@ -151,6 +152,8 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     progress(msg): callback for user-facing status messages; dicts are
             forwarded verbatim to the NDJSON stream (e.g. the early
             {"type": "image"} event once the 2D map preview is ready).
+    terrain_only: stop after the 2D map preview (image.png + meta.json) —
+            used by the fast "Generate Terrain" button; no meshes are built.
     """
     all_points = [p for t in trails for p in t["points"]]
     bounds = get_gpx_bounds(all_points)
@@ -239,6 +242,17 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     )
     progress({"type": "image", "path": job_dir.name})
 
+    if terrain_only:
+        (job_dir / "meta.json").write_text(json.dumps({
+            "settings":    cfg,
+            "terrainOnly": True,
+            "trailAmount": len(trails),
+            "eleMin":      float(grid.min()),
+            "eleMax":      float(grid.max()),
+            "gpxCount":    len(all_points),
+        }))
+        return
+
     use_gpx_ele = bool(cfg["useHeightFromGpx"])
     trail_tris = [
         gen.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
@@ -286,13 +300,28 @@ async def index():
     return FileResponse("static/index.html")
 
 
-# ── Upload / generate endpoint ────────────────────────────────────────────────
+# ── Upload / generate endpoints ───────────────────────────────────────────────
 @app.post("/api/upload")
 async def upload(
     file: Optional[List[UploadFile]] = File(None),
     fileHash: Optional[str] = Form(None),
     settings: str = Form("{}"),
 ):
+    """Full generation: 2D preview + all 3D meshes and printable STLs."""
+    return await _generate_endpoint(file, fileHash, settings, terrain_only=False)
+
+
+@app.post("/api/preview")
+async def preview(
+    file: Optional[List[UploadFile]] = File(None),
+    fileHash: Optional[str] = Form(None),
+    settings: str = Form("{}"),
+):
+    """Fast terrain-only generation: just the 2D map preview (image.png)."""
+    return await _generate_endpoint(file, fileHash, settings, terrain_only=True)
+
+
+async def _generate_endpoint(file, fileHash, settings, terrain_only):
     try:
         cfg = normalize_settings(json.loads(settings))
     except json.JSONDecodeError:
@@ -364,7 +393,8 @@ async def upload(
             job_dir = GENERATED_DIR / job_id
 
             task = asyncio.create_task(
-                asyncio.to_thread(_generate_job, job_dir, trails, cfg, progress)
+                asyncio.to_thread(_generate_job, job_dir, trails, cfg, progress,
+                                  terrain_only)
             )
             while not task.done():
                 try:

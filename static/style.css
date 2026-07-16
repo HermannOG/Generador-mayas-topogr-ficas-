@@ -53,14 +53,16 @@ body{background-color:#ebfaff}.page-content{padding-left:20px;padding-right:20px
   width: 100%;
 }
 
-/* 2D map preview: below the 3D viewer, and inside the loading overlay */
+/* 2D map preview: minimap pinned to the bottom-left of the viewer pane */
+.top-left { position: relative; }
 .map-preview {
-  align-self: center;
   border-radius: 12px;
-  box-shadow: 0 2px 10px #0000001f;
-  margin-top: 10px;
-  max-height: 32%;
-  object-fit: contain;
+  bottom: 22px;
+  box-shadow: 0 3px 12px #00000030;
+  left: 22px;
+  position: absolute;
+  width: 180px;
+  z-index: 5;
 }
 .loading-map-preview {
   border-radius: 12px;

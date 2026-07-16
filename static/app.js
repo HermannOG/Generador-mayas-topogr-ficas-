@@ -69,7 +69,10 @@ let nextTileId = 1;
 let cacheKey = 0;
 
 function makeTile(id) {
-  return { id, path: null, settings: { ...DEFAULT_SETTINGS }, fileHash: [], file: [] };
+  // path = job with 3D meshes; imagePath = latest job with a 2D map preview
+  // (a terrain-only run has imagePath but no meshes)
+  return { id, path: null, imagePath: null, settings: { ...DEFAULT_SETTINGS },
+           fileHash: [], file: [] };
 }
 
 function activeTile() {
@@ -180,10 +183,11 @@ function renderTiles() {
     el.className = "tile" + (tile.id === activeTileId ? " selected" : "");
     const content = document.createElement("div");
     content.className = "tile-content";
-    if (tile.path) {
+    const thumbPath = tile.imagePath ?? tile.path;
+    if (thumbPath) {
       const img = document.createElement("img");
       img.className = "tile-preview";
-      img.src = `${API_BASE}/public/${tile.path}/image.png?${cacheKey}`;
+      img.src = `${API_BASE}/public/${thumbPath}/image.png?${cacheKey}`;
       img.alt = "Preview";
       content.appendChild(img);
     } else {
@@ -222,12 +226,17 @@ function selectTile(id) {
 // ── Main pane: dropzone ↔ inline 3D viewer ─────────────────────────────────
 async function refreshViewer() {
   const tile = activeTile();
+
+  // Minimap: latest 2D map (terrain-only runs included)
+  const imagePath = tile.imagePath ?? tile.path;
+  mapPreview.hidden = !imagePath;
+  if (imagePath) {
+    mapPreview.src = `${API_BASE}/public/${imagePath}/image.png?${cacheKey}`;
+  }
+
   if (tile.path) {
     dropzone.style.display = "none";
     viewerCanvas.hidden = false;
-    // 2D map preview stays visible below the 3D viewer
-    mapPreview.src = `${API_BASE}/public/${tile.path}/image.png?${cacheKey}`;
-    mapPreview.hidden = false;
     try {
       await window.Preview3D.renderJob({
         base:        `${API_BASE}/public/${tile.path}`,
@@ -240,14 +249,14 @@ async function refreshViewer() {
     }
   } else {
     viewerCanvas.hidden = true;
-    mapPreview.hidden = true;
     dropzone.style.display = "flex";
     window.Preview3D?.clear();
   }
 }
 
 // ── Upload / generate (site's M function) ──────────────────────────────────
-async function upload(newFiles, settingsOverride = null) {
+// terrainOnly=true hits /api/preview: just the fast 2D map, no 3D meshes
+async function upload(newFiles, settingsOverride = null, terrainOnly = false) {
   const tile = activeTile();
 
   loadingOverlay.hidden = false;
@@ -270,7 +279,8 @@ async function upload(newFiles, settingsOverride = null) {
   fd.append("settings", JSON.stringify(settingsOverride || tile.settings));
 
   try {
-    const resp = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
+    const endpoint = terrainOnly ? "/preview" : "/upload";
+    const resp = await fetch(`${API_BASE}${endpoint}`, { method: "POST", body: fd });
     if (!resp.ok || !resp.body) {
       showError("Error uploading the file. " + resp.status);
       return;
@@ -299,7 +309,8 @@ async function upload(newFiles, settingsOverride = null) {
             loadingMapImg.src = `${API_BASE}/public/${msg.path}/image.png?${Date.now()}`;
             loadingMapImg.hidden = false;
           } else if (msg.type === "path") {
-            tile.path = msg.path;
+            if (!terrainOnly) tile.path = msg.path;
+            tile.imagePath = msg.path;
             tile.fileHash = msg.fileHash;
           } else if (msg.type === "error") {
             showError(msg.message);
@@ -378,6 +389,16 @@ document.getElementById("updateBtn").addEventListener("click", async () => {
     return;
   }
   await upload(tile.file);
+});
+
+// Fast 2D terrain preview only — no 3D model is built
+document.getElementById("terrainBtn").addEventListener("click", async () => {
+  const tile = activeTile();
+  if (tile.file.length === 0 && tile.fileHash.length === 0) {
+    showError("Please load a GPX file first.");
+    return;
+  }
+  await upload(tile.file, null, true);
 });
 
 document.getElementById("downloadBtn").addEventListener("click", async () => {
