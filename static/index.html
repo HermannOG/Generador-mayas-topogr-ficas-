@@ -101,6 +101,18 @@
             <div class="color-picker"><input type="color" id="trackColor" /></div>
           </div>
 
+          <h2 class="category-title">Forest</h2>
+          <div class="settings-group">
+            <label>Forest Coverage
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Procedurally grows forests outward from the mapped OpenStreetMap forests: patches spread into the most likely ground first (nearby, lower, gentler, moister), never above the local tree line. 0 = mapped forests only, 1 = fully forested.</span></span>
+            </label>
+            <div class="slider-row">
+              <input type="range" min="0" max="1" step="0.05" data-setting="forestLevel" />
+              <input type="number" min="0" max="1" step="0.05" data-setting="forestLevel" />
+            </div>
+          </div>
+
           <h2 class="category-title">Snow</h2>
           <div class="settings-group">
             <label>Snow Coverage

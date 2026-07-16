@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS = {
   sandColor: "#D9BE8C",    // tan
   snowColor: "#EFEBE2",    // cream
   snowLevel: 0,            // 0 none → 1 everything under snow
+  forestLevel: 0,          // 0 mapped forests only → 1 fully grown
   heightScale: 1,
   trailWidth: 1,
   trailHeight: 1,
@@ -56,7 +57,7 @@ const CHECKBOX_KEYS = ["useHeightFromGpx", "higherResolution", "includeSeas",
 
 // Settings the site parses as numbers on change
 const NUMERIC_KEYS = [
-  "snowLevel", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
+  "snowLevel", "forestLevel", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
   "shapeHeight", "distanceTrackToBorder", "baseThickness", "base_size",
   "building_scale",
 ];

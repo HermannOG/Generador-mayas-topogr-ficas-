@@ -13,7 +13,7 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import binary_dilation, gaussian_filter
+from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import triangulate as shp_triangulate
@@ -51,7 +51,7 @@ class MeshGenerator:
 
     def generate_zone_tris(self, elevation_grid, lat_bounds, lon_bounds,
                            buildings=None, water=None, forests=None,
-                           snow_level=0.0, detect_ocean_m=None):
+                           forest_level=0.0, snow_level=0.0, detect_ocean_m=None):
         """
         Generate terrain geometry split into colour zones.
         Returns dict of triangle lists:
@@ -60,7 +60,8 @@ class MeshGenerator:
         go into "base" so the model sides always match the base colour.
 
         Ground classification:
-          forest : inside a mapped OSM forest polygon (real tree edges)
+          forest : mapped OSM forest polygons (real tree edges), procedurally
+                   grown outward as forest_level rises 0 → 1
           rock   : steep bare ground (slope above ROCK_SLOPE)
           sand   : the remaining gentle ground
           snow   : procedural snow cover, snow_level 0 (none) → 1 (everything)
@@ -84,7 +85,8 @@ class MeshGenerator:
         self._refresh_interp(grid)
 
         rows, cols = grid.shape
-        zone_map = self._build_zone_map(grid, water_mask, forests, snow_level)
+        zone_map = self._build_zone_map(grid, water_mask, forests,
+                                        forest_level, snow_level)
         self.last_zone_map = zone_map
 
         surface_tris, wall_tris = self._terrain(grid)
@@ -107,7 +109,7 @@ class MeshGenerator:
         zones["base"] = wall_tris
         return zones
 
-    def _build_zone_map(self, grid, water_mask, forests, snow_level):
+    def _build_zone_map(self, grid, water_mask, forests, forest_level, snow_level):
         """Per-cell zone ids: sand/forest/rock ground, then snow, then water."""
         rows, cols = grid.shape
 
@@ -117,12 +119,13 @@ class MeshGenerator:
         slope = np.hypot(gx, gy)
         zone = np.where(slope >= self.ROCK_SLOPE, self.Z_ROCK, self.Z_SAND).astype(np.uint8)
 
-        # Forests: real outlines from OSM only (no altitude rule)
-        if forests:
-            forest_mask = np.zeros((rows, cols), dtype=bool)
-            for f in forests:
-                forest_mask |= self._mask_from_feature(f, rows, cols)
-            zone[forest_mask] = self.Z_FOREST
+        # Forests: real OSM outlines as the baseline, grown procedurally
+        forest_mask = np.zeros((rows, cols), dtype=bool)
+        for f in forests or []:
+            forest_mask |= self._mask_from_feature(f, rows, cols)
+        forest_mask = self._grow_forest_mask(
+            grid, forest_mask, water_mask, forest_level, slope)
+        zone[forest_mask] = self.Z_FOREST
 
         snow_mask = self._build_snow_mask(grid, water_mask, snow_level, gx, gy, slope)
         if snow_mask is not None:
@@ -130,6 +133,60 @@ class MeshGenerator:
         if water_mask is not None:
             zone[water_mask] = self.Z_WATER
         return zone
+
+    def _grow_forest_mask(self, grid, base_mask, water_mask, forest_level, slope):
+        """
+        Grow forests procedurally from the OSM baseline. forest_level 0..1:
+        0 keeps exactly the mapped forests; 1 forests everything growable.
+        New trees appear in the most likely places first:
+          + next to existing forest (patches spread outward)
+          + lower, gentler, moister (hollows) ground
+          + a deterministic noise field seeds detached patches and keeps
+            edges ragged rather than evenly cut off
+        Trees never grow near the peaks: in mountainous terrain a local tree
+        line caps growth a little above the highest mapped forest.
+        """
+        level = min(1.0, max(0.0, float(forest_level)))
+        if level <= 0.0:
+            return base_mask
+
+        ele_min = float(grid.min())
+        ele_range = max(float(grid.max()) - ele_min, 1.0)
+
+        # Local tree line: only meaningful in mountainous terrain
+        cap = np.inf
+        if ele_range > 700.0:
+            cap = ele_min + 0.8 * ele_range
+            if base_mask.any():
+                cap = max(cap, float(np.quantile(grid[base_mask], 0.99)) + 0.05 * ele_range)
+
+        growable = (grid <= cap) & (slope < 2 * self.ROCK_SLOPE) & ~base_mask
+        if water_mask is not None:
+            growable &= ~water_mask
+        if not growable.any():
+            return base_mask
+
+        def z(x):
+            sd = float(np.std(x))
+            return (x - float(np.mean(x))) / (sd if sd > 1e-9 else 1.0)
+
+        # Distance from existing forest: spreading beats sprouting
+        if base_mask.any():
+            proximity = -distance_transform_edt(~base_mask)
+        else:
+            proximity = np.zeros(grid.shape)
+
+        hollows = gaussian_filter(grid, sigma=3.0) - grid
+        rng = np.random.default_rng(
+            abs(hash(("forest", round(self.lat_min, 4), round(self.lon_min, 4)))) % 2**32)
+        noise = gaussian_filter(rng.standard_normal(grid.shape), sigma=2.5)
+
+        score = (1.5 * np.tanh(z(proximity)) - 1.0 * z(grid) + 0.4 * np.tanh(z(hollows))
+                 - 0.5 * np.clip(z(slope), 0.0, None) + 0.9 * noise)
+
+        # level = fraction of the growable area that gets trees
+        thr = float(np.quantile(score[growable], 1.0 - level))
+        return base_mask | (growable & (score >= thr))
 
     def _build_snow_mask(self, grid, water_mask, snow_level, gx, gy, slope):
         """

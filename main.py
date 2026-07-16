@@ -58,6 +58,7 @@ DEFAULT_SETTINGS = {
     "sandColor":             "#D9BE8C",   # tan
     "snowColor":             "#EFEBE2",   # cream
     "snowLevel":             0,           # 0 none → 1 everything under snow
+    "forestLevel":           0,           # 0 mapped forests only → 1 fully grown
     "heightScale":           1,
     "trailWidth":            1,
     "trailHeight":           1,
@@ -216,6 +217,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     zones = gen.generate_zone_tris(
         grid, lat_b, lon_b,
         buildings=buildings_data, water=water_data, forests=forest_data,
+        forest_level=float(cfg["forestLevel"]),
         snow_level=float(cfg["snowLevel"]), detect_ocean_m=detect_ocean_m,
     )
     use_gpx_ele = bool(cfg["useHeightFromGpx"])
