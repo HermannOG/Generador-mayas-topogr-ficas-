@@ -148,7 +148,9 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     Blocking generation pipeline: elevation → water/buildings → meshes → assets.
     trails: list of {"points": [(lat, lon, ele)...], "flat": bool} per GPX file
             (flat=True for swims — the ribbon stays at one height).
-    progress(msg): callback for user-facing status messages.
+    progress(msg): callback for user-facing status messages; dicts are
+            forwarded verbatim to the NDJSON stream (e.g. the early
+            {"type": "image"} event once the 2D map preview is ready).
     """
     all_points = [p for t in trails for p in t["points"]]
     bounds = get_gpx_bounds(all_points)
@@ -220,32 +222,8 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
         forest_level=float(cfg["forestLevel"]),
         snow_level=float(cfg["snowLevel"]), detect_ocean_m=detect_ocean_m,
     )
-    use_gpx_ele = bool(cfg["useHeightFromGpx"])
-    trail_tris = [
-        gen.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
-        for t in trails
-    ]
-    border = gen.border_tris()        # border slab + raised text labels
-    zones["base"] = zones["base"] + border["base"]   # walls/bottom + slab
-    zones["text"] = border["text"]
-
-    progress("Writing model files")
+    # 2D map preview first — the client can show it while the 3D build runs
     job_dir.mkdir(parents=True, exist_ok=True)
-
-    # Viewer assets: terrain.obj (zone groups) + one trail{i}.obj per GPX file
-    (job_dir / "terrain.obj").write_bytes(gen.to_obj_bytes(zones))
-    for i, tris in enumerate(trail_tris):
-        (job_dir / f"trail{i}.obj").write_bytes(gen.to_obj_bytes({"trail": tris}))
-
-    # Printable STLs: combined map + separate terrain/trails for multi-filament
-    terrain_tris = [t for tris in zones.values() for t in tris]
-    all_trail_tris = [t for tris in trail_tris for t in tris]
-    (job_dir / "map.stl").write_bytes(gen.to_stl_bytes(terrain_tris + all_trail_tris))
-    (job_dir / "terrain.stl").write_bytes(gen.to_stl_bytes(terrain_tris))
-    for i, tris in enumerate(trail_tris):
-        (job_dir / f"trail{i}.stl").write_bytes(gen.to_stl_bytes(tris))
-
-    # Tile thumbnail
     render_preview_png(
         grid, gen.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
         [t["points"] for t in trails],
@@ -259,6 +237,31 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
         },
         job_dir / "image.png",
     )
+    progress({"type": "image", "path": job_dir.name})
+
+    use_gpx_ele = bool(cfg["useHeightFromGpx"])
+    trail_tris = [
+        gen.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
+        for t in trails
+    ]
+    border = gen.border_tris()        # border slab + raised text labels
+    zones["base"] = zones["base"] + border["base"]   # walls/bottom + slab
+    zones["text"] = border["text"]
+
+    progress("Writing model files")
+
+    # Viewer assets: terrain.obj (zone groups) + one trail{i}.obj per GPX file
+    (job_dir / "terrain.obj").write_bytes(gen.to_obj_bytes(zones))
+    for i, tris in enumerate(trail_tris):
+        (job_dir / f"trail{i}.obj").write_bytes(gen.to_obj_bytes({"trail": tris}))
+
+    # Printable STLs: combined map + separate terrain/trails for multi-filament
+    terrain_tris = [t for tris in zones.values() for t in tris]
+    all_trail_tris = [t for tris in trail_tris for t in tris]
+    (job_dir / "map.stl").write_bytes(gen.to_stl_bytes(terrain_tris + all_trail_tris))
+    (job_dir / "terrain.stl").write_bytes(gen.to_stl_bytes(terrain_tris))
+    for i, tris in enumerate(trail_tris):
+        (job_dir / f"trail{i}.stl").write_bytes(gen.to_stl_bytes(tris))
 
     (job_dir / "meta.json").write_text(json.dumps({
         "settings":    cfg,
@@ -331,7 +334,13 @@ async def upload(
         loop = asyncio.get_running_loop()
 
         def progress(msg):
+            # Strings become info lines; dicts pass through verbatim
             loop.call_soon_threadsafe(queue.put_nowait, msg)
+
+        def as_line(msg):
+            if isinstance(msg, dict):
+                return line(msg)
+            return line({"type": "info", "message": msg})
 
         yield line({"type": "info", "message": "Parsing GPX files"})
         try:
@@ -360,13 +369,13 @@ async def upload(
             while not task.done():
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    yield line({"type": "info", "message": msg})
+                    yield as_line(msg)
                 except asyncio.TimeoutError:
                     pass
             task.result()  # re-raise generation errors
 
             while not queue.empty():
-                yield line({"type": "info", "message": queue.get_nowait()})
+                yield as_line(queue.get_nowait())
             yield line({"type": "path", "path": job_id, "fileHash": hashes})
 
         except Exception as exc:

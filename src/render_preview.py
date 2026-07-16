@@ -18,7 +18,7 @@ def _hex_to_rgb(h, fallback=(128, 128, 128)):
 
 
 def render_preview_png(grid, zone_map, zone_names, lat_bounds, lon_bounds,
-                       trails, colors, out_path, size=320):
+                       trails, colors, out_path, size=512):
     """
     grid        : elevation ndarray (rows, cols), row 0 = lat_max
     zone_map    : uint8 ndarray same shape, values index into zone_names

@@ -85,6 +85,8 @@ const tilesContainer  = document.getElementById("tilesContainer");
 const viewerCanvas    = document.getElementById("viewerCanvas");
 const loadingOverlay  = document.getElementById("loadingOverlay");
 const loadingMessage  = document.getElementById("loadingMessage");
+const loadingMapImg   = document.getElementById("loadingMapPreview");
+const mapPreview      = document.getElementById("mapPreview");
 const errorMessage    = document.getElementById("errorMessage");
 const errorText      = document.getElementById("errorText");
 const uploadedList    = document.getElementById("uploadedFilesList");
@@ -223,6 +225,9 @@ async function refreshViewer() {
   if (tile.path) {
     dropzone.style.display = "none";
     viewerCanvas.hidden = false;
+    // 2D map preview stays visible below the 3D viewer
+    mapPreview.src = `${API_BASE}/public/${tile.path}/image.png?${cacheKey}`;
+    mapPreview.hidden = false;
     try {
       await window.Preview3D.renderJob({
         base:        `${API_BASE}/public/${tile.path}`,
@@ -235,6 +240,7 @@ async function refreshViewer() {
     }
   } else {
     viewerCanvas.hidden = true;
+    mapPreview.hidden = true;
     dropzone.style.display = "flex";
     window.Preview3D?.clear();
   }
@@ -246,6 +252,8 @@ async function upload(newFiles, settingsOverride = null) {
 
   loadingOverlay.hidden = false;
   loadingMessage.textContent = "Sending data to Server";
+  loadingMapImg.hidden = true;
+  loadingMapImg.removeAttribute("src");
 
   // Merge new files into the tile (dedupe by name), like the site does
   tile.file = [
@@ -286,6 +294,10 @@ async function upload(newFiles, settingsOverride = null) {
           const msg = JSON.parse(line);
           if (msg.type === "info") {
             loadingMessage.textContent = msg.message;
+          } else if (msg.type === "image") {
+            // The 2D map is ready before the 3D build — show it right away
+            loadingMapImg.src = `${API_BASE}/public/${msg.path}/image.png?${Date.now()}`;
+            loadingMapImg.hidden = false;
           } else if (msg.type === "path") {
             tile.path = msg.path;
             tile.fileHash = msg.fileHash;

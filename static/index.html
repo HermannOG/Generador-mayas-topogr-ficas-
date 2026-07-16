@@ -41,6 +41,7 @@
     <div class="loading-text">
       Generating Map... This can take a while.
       <div class="loading-message" id="loadingMessage"></div>
+      <img id="loadingMapPreview" class="loading-map-preview" alt="Map preview" hidden />
       <div class="loading-donate-message">
         Support the project with a
         <a href="https://buymeacoffee.com/topotrail" target="_blank" rel="noopener noreferrer" class="donate-link">donation</a>.
@@ -58,6 +59,7 @@
           <input type="file" id="fileInput" accept=".gpx" multiple hidden />
         </div>
         <canvas id="viewerCanvas" hidden></canvas>
+        <img id="mapPreview" class="map-preview" alt="Map preview" hidden />
       </div>
       <div class="bottom-left">
         <div class="tiles-container" id="tilesContainer"></div>
