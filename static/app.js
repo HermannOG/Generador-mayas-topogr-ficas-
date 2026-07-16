@@ -12,13 +12,16 @@
 
 const API_BASE = "/api";
 
-// Site defaults (verbatim from the topotrail.com bundle)
+// Settings schema follows topotrail.com (camelCase) with TopoTrail
+// extensions. Colours default to a retro national-park palette.
 const DEFAULT_SETTINGS = {
-  waterColor: "#0084ff",
-  landColor: "#00FF00",
+  waterColor: "#4A7A8C",   // dusty teal
+  landColor: "#667C4E",    // forest olive
   trackColor: "#FC5200",
-  rockColor: "#BDBDBD",
-  treeLine: 1250,
+  rockColor: "#8C7A6B",    // warm taupe
+  sandColor: "#D9BE8C",    // tan
+  snowColor: "#EFEBE2",    // cream
+  snowLevel: 0,            // 0 none → 1 everything under snow
   heightScale: 1,
   trailWidth: 1,
   trailHeight: 1,
@@ -45,14 +48,15 @@ const DEFAULT_SETTINGS = {
 };
 
 // Panel inputs whose element id === settings key
-const COLOR_KEYS = ["waterColor", "landColor", "trackColor", "rockColor",
-                    "buildingsColor", "baseColor", "textColor"];
+const COLOR_KEYS = ["waterColor", "landColor", "sandColor", "rockColor",
+                    "snowColor", "trackColor", "buildingsColor", "baseColor",
+                    "textColor"];
 const CHECKBOX_KEYS = ["useHeightFromGpx", "higherResolution", "includeSeas",
                        "includeLakes", "includeRivers", "buildings"];
 
 // Settings the site parses as numbers on change
 const NUMERIC_KEYS = [
-  "treeLine", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
+  "snowLevel", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
   "shapeHeight", "distanceTrackToBorder", "baseThickness", "base_size",
   "building_scale",
 ];

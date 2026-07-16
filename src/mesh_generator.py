@@ -13,7 +13,7 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, gaussian_filter
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import triangulate as shp_triangulate
@@ -42,26 +42,34 @@ class MeshGenerator:
 
     # ── Public API ────────────────────────────────────────────────────────
 
+    # Zone ids used in the per-cell zone map (thumbnail + classification)
+    ZONES = ("sand", "forest", "rock", "water", "snow")
+    Z_SAND, Z_FOREST, Z_ROCK, Z_WATER, Z_SNOW = range(5)
+
+    # Ground steeper than this (rise/run) reads as bare rock, not sand
+    ROCK_SLOPE = 0.45
+
     def generate_zone_tris(self, elevation_grid, lat_bounds, lon_bounds,
                            buildings=None, water=None, forests=None,
-                           tree_line_m=1250.0, detect_ocean_m=None):
+                           snow_level=0.0, detect_ocean_m=None):
         """
         Generate terrain geometry split into colour zones.
         Returns dict of triangle lists:
-          {"land", "rock", "water", "buildings", "base"}
+          {"sand", "forest", "rock", "water", "snow", "buildings", "base"}
         Only the top SURFACE gets terrain colours — side walls and the bottom
         go into "base" so the model sides always match the base colour.
 
-        water/forests: features from fetch_map_features().
-        Land/rock split: a cell is vegetated (land) when it lies below the
-        tree_line_m altitude OR inside a mapped OSM forest polygon — mapped
-        forests give real tree edges, the altitude rule fills unmapped areas.
-        detect_ocean_m: if not None, cells with original elevation <= this value
-        (metres) are treated as sea/ocean.
+        Ground classification:
+          forest : inside a mapped OSM forest polygon (real tree edges)
+          rock   : steep bare ground (slope above ROCK_SLOPE)
+          sand   : the remaining gentle ground
+          snow   : procedural snow cover, snow_level 0 (none) → 1 (everything)
+        detect_ocean_m: if not None, cells with original elevation <= this
+        value (metres) are treated as sea/ocean.
 
         Leaves the generator set up, so route_tris() can be called afterwards.
-        Masks stay available as self.last_water_mask / self.last_rock_mask
-        (vertex lattice) for the thumbnail renderer.
+        The per-cell zone map stays available as self.last_zone_map for the
+        thumbnail renderer (values = Z_* ids).
         """
         self._setup(elevation_grid, lat_bounds, lon_bounds)
         water_mask, grid = self._build_water_features(
@@ -76,15 +84,14 @@ class MeshGenerator:
         self._refresh_interp(grid)
 
         rows, cols = grid.shape
-        rock_mask = self._build_rock_mask(grid, forests, tree_line_m)
-        self.last_rock_mask = rock_mask
+        zone_map = self._build_zone_map(grid, water_mask, forests, snow_level)
+        self.last_zone_map = zone_map
 
         surface_tris, wall_tris = self._terrain(grid)
 
+        zones = {name: [] for name in self.ZONES}
         tris = np.asarray(surface_tris, dtype=np.float64)
-        if tris.size == 0:
-            zones = {"land": [], "rock": [], "water": []}
-        else:
+        if tris.size:
             # Classify by centroid cell. Floor (not round) so both triangles
             # of a quad land in the same cell — otherwise thin features like
             # rivers render dashed.
@@ -92,35 +99,79 @@ class MeshGenerator:
             cy = tris[:, :, 1].mean(axis=1)
             j = np.clip((cx / self.model_w * (cols - 1)).astype(int), 0, cols - 1)
             i = np.clip(((1.0 - cy / self.model_h) * (rows - 1)).astype(int), 0, rows - 1)
-
-            in_water = water_mask[i, j] if water_mask is not None \
-                else np.zeros(len(tris), dtype=bool)
-            is_rock = rock_mask[i, j] & ~in_water
-            is_land = ~in_water & ~is_rock
-            zones = {
-                "land":  tris[is_land].tolist(),
-                "rock":  tris[is_rock].tolist(),
-                "water": tris[in_water].tolist(),
-            }
+            tri_zone = zone_map[i, j]
+            for zid, name in enumerate(self.ZONES):
+                zones[name] = tris[tri_zone == zid].tolist()
 
         zones["buildings"] = self._buildings(buildings) if buildings else []
         zones["base"] = wall_tris
         return zones
 
-    def _build_rock_mask(self, grid, forests, tree_line_m):
-        """
-        Vertex-lattice mask of non-vegetated ("rock") terrain: above the tree
-        line AND not inside a mapped forest. OSM forest polygons carve real
-        tree edges; the altitude rule covers areas OSM hasn't mapped.
-        """
+    def _build_zone_map(self, grid, water_mask, forests, snow_level):
+        """Per-cell zone ids: sand/forest/rock ground, then snow, then water."""
         rows, cols = grid.shape
-        rock = grid >= tree_line_m
+
+        # Ground: gentle = sand, steep = rock
+        cell_m = max((self.lat_max - self.lat_min) * 111_000 / max(rows - 1, 1), 1.0)
+        gy, gx = np.gradient(grid, cell_m)
+        slope = np.hypot(gx, gy)
+        zone = np.where(slope >= self.ROCK_SLOPE, self.Z_ROCK, self.Z_SAND).astype(np.uint8)
+
+        # Forests: real outlines from OSM only (no altitude rule)
         if forests:
             forest_mask = np.zeros((rows, cols), dtype=bool)
             for f in forests:
                 forest_mask |= self._mask_from_feature(f, rows, cols)
-            rock &= ~forest_mask
-        return rock
+            zone[forest_mask] = self.Z_FOREST
+
+        snow_mask = self._build_snow_mask(grid, water_mask, snow_level, gx, gy, slope)
+        if snow_mask is not None:
+            zone[snow_mask] = self.Z_SNOW
+        if water_mask is not None:
+            zone[water_mask] = self.Z_WATER
+        return zone
+
+    def _build_snow_mask(self, grid, water_mask, snow_level, gx, gy, slope):
+        """
+        Procedural snow cover. snow_level 0..1 sets roughly the fraction of
+        (non-water) terrain under snow, distributed realistically:
+          + higher terrain first (snow line drags down as the slider rises)
+          + shaded slopes keep snow longer (north-facing in the northern
+            hemisphere, south-facing below the equator)
+          + hollows and gullies hold drifts
+          + patchy noise at the melt edge (deterministic per location)
+          - the steepest cliff faces shed their snow
+        """
+        s = min(1.0, max(0.0, float(snow_level)))
+        if s <= 0.0:
+            return None
+        not_water = ~water_mask if water_mask is not None else np.ones(grid.shape, bool)
+        if s >= 1.0:
+            return not_water
+
+        def z(x):
+            sd = float(np.std(x))
+            return (x - float(np.mean(x))) / (sd if sd > 1e-9 else 1.0)
+
+        ele_n = (grid - grid.min()) / max(grid.max() - grid.min(), 1.0)
+
+        # gy is the north→south row gradient: positive on north-facing slopes
+        lat_mid = (self.lat_min + self.lat_max) / 2.0
+        shade = gy if lat_mid >= 0 else -gy
+
+        # Hollows: locally below the smoothed surface
+        hollows = gaussian_filter(grid, sigma=3.0) - grid
+
+        rng = np.random.default_rng(
+            abs(hash((round(self.lat_min, 4), round(self.lon_min, 4)))) % 2**32)
+        noise = gaussian_filter(rng.standard_normal(grid.shape), sigma=2.0)
+
+        score = (3.0 * z(ele_n) + 0.8 * np.tanh(z(shade)) + 0.5 * np.tanh(z(hollows))
+                 + 0.5 * noise - 0.6 * np.clip(z(slope), 0.0, None))
+
+        # Threshold at the requested coverage over non-water terrain
+        thr = float(np.quantile(score[not_water], 1.0 - s))
+        return (score >= thr) & not_water
 
     def route_tris(self, gpx_points, flat=False, use_gpx_ele=False):
         """

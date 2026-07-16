@@ -83,10 +83,12 @@ function applyColors(objRoot, colorByName, fallback) {
 async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
   if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
 
-  const landColor      = settings.landColor      ?? "#00FF00";
-  const rockColor      = settings.rockColor      ?? "#BDBDBD";
+  const forestColor    = settings.landColor      ?? "#667C4E";
+  const rockColor      = settings.rockColor      ?? "#8C7A6B";
+  const sandColor      = settings.sandColor      ?? "#D9BE8C";
+  const snowColor      = settings.snowColor      ?? "#EFEBE2";
   const trackColor     = settings.trackColor     ?? "#FC5200";
-  const waterColor     = settings.waterColor     ?? "#0084ff";
+  const waterColor     = settings.waterColor     ?? "#4A7A8C";
   const buildingsColor = settings.buildingsColor ?? "#777777";
   const baseColor      = settings.baseColor      ?? "#FFFFFF";
   const textColor      = settings.textColor      ?? "#000000";
@@ -95,13 +97,15 @@ async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 })
 
   const terrain = await loader.loadAsync(`${base}/terrain.obj?v=${cacheKey}`);
   applyColors(terrain, {
-    land:      landColor,
+    forest:    forestColor,
+    sand:      sandColor,
     rock:      rockColor,
+    snow:      snowColor,
     water:     waterColor,
     buildings: buildingsColor,
     base:      baseColor,
     text:      textColor,
-  }, landColor);
+  }, sandColor);
   geoGroup.add(terrain);
 
   for (let i = 0; i < trailAmount; i++) {

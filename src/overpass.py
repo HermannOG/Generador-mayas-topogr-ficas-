@@ -9,17 +9,22 @@ import time
 
 import requests
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Mirrors are rotated through on failure (rate limits, timeouts)
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
 USER_AGENT = "TopoTrail/1.0 (github.com/topotrail; 3D-print map generator)"
 
 
-def query_overpass(query, retries=3):
+def query_overpass(query, retries=4):
     """POST an Overpass QL query, return decoded JSON. Raises on failure."""
     last_exc = None
     for attempt in range(retries):
+        url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
         try:
             resp = requests.post(
-                OVERPASS_URL,
+                url,
                 data={"data": query},
                 headers={"User-Agent": USER_AGENT},
                 timeout=90,

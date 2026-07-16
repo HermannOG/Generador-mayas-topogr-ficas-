@@ -48,13 +48,16 @@ GENERATED_DIR = Path("generated")
 GPX_STORE     = GENERATED_DIR / "gpx"
 JOB_TTL_S     = 24 * 3600
 
-# Same settings schema and defaults as the topotrail.com front-end
+# Settings schema follows the topotrail.com front-end (camelCase), with
+# TopoTrail extensions. Colours default to a retro national-park palette.
 DEFAULT_SETTINGS = {
-    "waterColor":            "#0084ff",
-    "landColor":             "#00FF00",
+    "waterColor":            "#4A7A8C",   # dusty teal
+    "landColor":             "#667C4E",   # forest olive
     "trackColor":            "#FC5200",
-    "rockColor":             "#BDBDBD",
-    "treeLine":              1250,
+    "rockColor":             "#8C7A6B",   # warm taupe
+    "sandColor":             "#D9BE8C",   # tan
+    "snowColor":             "#EFEBE2",   # cream
+    "snowLevel":             0,           # 0 none → 1 everything under snow
     "heightScale":           1,
     "trailWidth":            1,
     "trailHeight":           1,
@@ -86,7 +89,6 @@ LEGACY_KEYS = {
     "landColor":             "land_color",
     "trackColor":            "trail_color",
     "rockColor":             "rock_color",
-    "treeLine":              "tree_line",
     "heightScale":           "height_scale",
     "trailWidth":            "trail_width",
     "trailHeight":           "trail_height",
@@ -210,12 +212,11 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
 
     # For open seas/bays, SRTM returns ~0 m — use elevation threshold
     detect_ocean_m = 0.5 if cfg["includeSeas"] else None
-    tree_line_m = float(cfg["treeLine"])
 
     zones = gen.generate_zone_tris(
         grid, lat_b, lon_b,
         buildings=buildings_data, water=water_data, forests=forest_data,
-        tree_line_m=tree_line_m, detect_ocean_m=detect_ocean_m,
+        snow_level=float(cfg["snowLevel"]), detect_ocean_m=detect_ocean_m,
     )
     use_gpx_ele = bool(cfg["useHeightFromGpx"])
     trail_tris = [
@@ -235,8 +236,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
         (job_dir / f"trail{i}.obj").write_bytes(gen.to_obj_bytes({"trail": tris}))
 
     # Printable STLs: combined map + separate terrain/trails for multi-filament
-    terrain_tris = (zones["land"] + zones["rock"] + zones["water"]
-                    + zones["buildings"] + zones["base"] + zones["text"])
+    terrain_tris = [t for tris in zones.values() for t in tris]
     all_trail_tris = [t for tris in trail_tris for t in tris]
     (job_dir / "map.stl").write_bytes(gen.to_stl_bytes(terrain_tris + all_trail_tris))
     (job_dir / "terrain.stl").write_bytes(gen.to_stl_bytes(terrain_tris))
@@ -245,14 +245,15 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
 
     # Tile thumbnail
     render_preview_png(
-        grid, gen.last_water_mask, lat_b, lon_b,
+        grid, gen.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
         [t["points"] for t in trails],
-        gen.last_rock_mask,
         {
-            "land":  cfg["landColor"],
-            "rock":  cfg["rockColor"],
-            "water": cfg["waterColor"],
-            "track": cfg["trackColor"],
+            "sand":   cfg["sandColor"],
+            "forest": cfg["landColor"],
+            "rock":   cfg["rockColor"],
+            "water":  cfg["waterColor"],
+            "snow":   cfg["snowColor"],
+            "track":  cfg["trackColor"],
         },
         job_dir / "image.png",
     )

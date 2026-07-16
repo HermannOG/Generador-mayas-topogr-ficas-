@@ -75,29 +75,45 @@
             <div class="color-picker"><input type="color" id="waterColor" /></div>
           </div>
           <div class="settings-group">
-            <label>Land Color</label>
+            <label>Forest Color
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Forests use real outlines from OpenStreetMap data.</span></span>
+            </label>
             <div class="color-picker"><input type="color" id="landColor" /></div>
+          </div>
+          <div class="settings-group">
+            <label>Sand Color
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Gentle open ground. Steeper ground uses the rock color.</span></span>
+            </label>
+            <div class="color-picker"><input type="color" id="sandColor" /></div>
           </div>
           <div class="settings-group">
             <label>Rock Color</label>
             <div class="color-picker"><input type="color" id="rockColor" /></div>
           </div>
           <div class="settings-group">
+            <label>Snow Color</label>
+            <div class="color-picker"><input type="color" id="snowColor" /></div>
+          </div>
+          <div class="settings-group">
             <label>Trail Color</label>
             <div class="color-picker"><input type="color" id="trackColor" /></div>
           </div>
 
-          <h2 class="category-title">Trail</h2>
+          <h2 class="category-title">Snow</h2>
           <div class="settings-group">
-            <label>Tree Line
+            <label>Snow Coverage
               <span class="info-icon-wrapper"><span class="info-icon">i</span>
-                <span class="info-tooltip">Altitude in meters above which the 3D model uses the rock color. Real forest outlines from OpenStreetMap are used instead where they cover enough of the map.</span></span>
+                <span class="info-tooltip">Procedurally generated snow: peaks whiten first, shaded slopes and hollows hold snow longer, cliffs shed it. 0 = no snow, 1 = full winter.</span></span>
             </label>
             <div class="slider-row">
-              <input type="range" min="0" max="5000" data-setting="treeLine" />
-              <input type="number" min="0" max="5000" data-setting="treeLine" />
+              <input type="range" min="0" max="1" step="0.05" data-setting="snowLevel" />
+              <input type="number" min="0" max="1" step="0.05" data-setting="snowLevel" />
             </div>
           </div>
+
+          <h2 class="category-title">Trail</h2>
           <div class="settings-group">
             <label>Height Scale
               <span class="info-icon-wrapper"><span class="info-icon">i</span>
