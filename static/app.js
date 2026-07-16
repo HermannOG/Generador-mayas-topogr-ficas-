@@ -1,362 +1,406 @@
 "use strict";
 
+/**
+ * Generator page logic — vanilla-JS port of the topotrail.com React
+ * component ($S in their bundle), which is the source of truth:
+ *   - per-tile settings + GPX file list (multiple trails per tile)
+ *   - dropping a GPX starts generation immediately (POST /api/upload, NDJSON)
+ *   - fileHash reuse: files upload once, re-generations send hashes only
+ *   - inline OBJ viewer in the main pane, image.png thumbnails on tiles
+ *   - Download fetches the ready-made ZIP for the tile's job path
+ */
+
+const API_BASE = "/api";
+
+// Site defaults (verbatim from the topotrail.com bundle)
+const DEFAULT_SETTINGS = {
+  waterColor: "#0084ff",
+  landColor: "#00FF00",
+  trackColor: "#FC5200",
+  rockColor: "#BDBDBD",
+  treeLine: 1250,
+  heightScale: 1,
+  trailWidth: 1,
+  trailHeight: 1,
+  useHeightFromGpx: false,
+  shape: "hexagon",
+  distanceTrackToBorder: 0.25,
+  baseThickness: 5,
+  includeSeas: true,
+  includeLakes: true,
+  includeRivers: false,
+  base_size: 100,
+  center: "normal",
+  buildings: false,
+  building_scale: 1,
+  buildingsColor: "#777777",
+  higherResolution: false,
+  singleColor: false,
+  singleColor_gap: 0.5,
+  // TopoTrail extensions (not on topotrail.com): hexagon border with text
+  baseColor: "#FFFFFF",
+  textColor: "#000000",
+  borderLabels: ["", "", "", "", "", ""],
+  // order: top, upper-right, lower-right, bottom, lower-left, upper-left
+};
+
+// Panel inputs whose element id === settings key
+const COLOR_KEYS = ["waterColor", "landColor", "trackColor", "rockColor",
+                    "buildingsColor", "baseColor", "textColor"];
+const CHECKBOX_KEYS = ["useHeightFromGpx", "higherResolution", "includeSeas",
+                       "includeLakes", "includeRivers", "buildings"];
+
+// Settings the site parses as numbers on change
+const NUMERIC_KEYS = [
+  "treeLine", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
+  "shapeHeight", "distanceTrackToBorder", "baseThickness", "base_size",
+  "building_scale",
+];
+
 // ── State ──────────────────────────────────────────────────────────────────
-const tiles = [{ gpxFile: null, gpxName: "Empty Tile", routeCoords: [] }];
-let activeTileIdx = 0;
-let leafletMap = null;
-let routeLayer = null;
-let nextTileId  = 1;
+let tiles = [makeTile(0)];
+let activeTileId = 0;
+let nextTileId = 1;
+let cacheKey = 0;
+
+function makeTile(id) {
+  return { id, path: null, settings: { ...DEFAULT_SETTINGS }, fileHash: [], file: [] };
+}
+
+function activeTile() {
+  return tiles.find(t => t.id === activeTileId);
+}
 
 // ── DOM references ─────────────────────────────────────────────────────────
-const dropZone    = document.getElementById("dropZone");
-const dropInner   = document.getElementById("dropInner");
-const mapContainer = document.getElementById("mapContainer");
-const fileInput   = document.getElementById("fileInput");
-const trailDrop   = document.getElementById("trailDrop");
-const trailInput  = document.getElementById("trailInput");
-const tileBar     = document.getElementById("tileBar");
-const tileAdd     = document.getElementById("tileAdd");
-const loadingOverlay = document.getElementById("loadingOverlay");
-const loadingTitle   = document.getElementById("loadingTitle");
-const loadingSub     = document.getElementById("loadingSub");
+const dropzone        = document.getElementById("dropzone");
+const fileInput       = document.getElementById("fileInput");
+const addTrailDrop    = document.getElementById("addTrailDropzone");
+const addTrailInput   = document.getElementById("addTrailInput");
+const tilesContainer  = document.getElementById("tilesContainer");
+const viewerCanvas    = document.getElementById("viewerCanvas");
+const loadingOverlay  = document.getElementById("loadingOverlay");
+const loadingMessage  = document.getElementById("loadingMessage");
+const errorMessage    = document.getElementById("errorMessage");
+const errorText      = document.getElementById("errorText");
+const uploadedList    = document.getElementById("uploadedFilesList");
 
-// ── Drop zone: main ────────────────────────────────────────────────────────
-dropZone.addEventListener("click", (e) => {
-  if (e.target === dropZone || e.target === dropInner ||
-      dropInner.contains(e.target)) {
-    fileInput.click();
-  }
+// ── Error banner ───────────────────────────────────────────────────────────
+function showError(msg) {
+  errorText.textContent = msg;
+  errorMessage.hidden = false;
+}
+document.getElementById("errorClose").addEventListener("click", () => {
+  errorMessage.hidden = true;
 });
 
-["dragover", "dragenter"].forEach(evt =>
-  dropZone.addEventListener(evt, e => {
-    e.preventDefault();
-    dropZone.classList.add("drag-over");
-  })
-);
-
-["dragleave", "dragend"].forEach(evt =>
-  dropZone.addEventListener(evt, () => dropZone.classList.remove("drag-over"))
-);
-
-dropZone.addEventListener("drop", e => {
-  e.preventDefault();
-  dropZone.classList.remove("drag-over");
-  const file = e.dataTransfer.files[0];
-  if (file) loadGPX(file);
-});
-
-fileInput.addEventListener("change", e => {
-  const file = e.target.files[0];
-  if (file) loadGPX(file);
-  fileInput.value = "";
-});
-
-// ── Drop zone: trail (secondary GPX) ──────────────────────────────────────
-trailDrop.addEventListener("click", () => trailInput.click());
-trailDrop.addEventListener("dragover", e => { e.preventDefault(); trailDrop.style.background = "#e8f8fc"; });
-trailDrop.addEventListener("dragleave", () => { trailDrop.style.background = ""; });
-trailDrop.addEventListener("drop", e => {
-  e.preventDefault();
-  trailDrop.style.background = "";
-  const file = e.dataTransfer.files[0];
-  if (file) loadGPX(file);
-});
-trailInput.addEventListener("change", e => {
-  const file = e.target.files[0];
-  if (file) loadGPX(file);
-  trailInput.value = "";
-});
-
-// ── Load GPX ───────────────────────────────────────────────────────────────
-function loadGPX(file) {
-  tiles[activeTileIdx].gpxFile = file;
-  tiles[activeTileIdx].gpxName = file.name.replace(/\.gpx$/i, "");
-
-  const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(e.target.result, "text/xml");
-      const coords = extractCoords(doc);
-      tiles[activeTileIdx].routeCoords = coords;
-      showMap(coords);
-      updateTileUI(activeTileIdx);
-    } catch (err) {
-      alert("Error leyendo el archivo GPX: " + err.message);
-    }
-  };
-  reader.readAsText(file);
-}
-
-function extractCoords(doc) {
-  const tags = ["trkpt", "rtept", "wpt"];
-  let pts = [];
-  for (const tag of tags) {
-    const nodes = doc.querySelectorAll(tag);
-    if (nodes.length > 0) {
-      pts = Array.from(nodes).map(n => [
-        parseFloat(n.getAttribute("lat")),
-        parseFloat(n.getAttribute("lon")),
-      ]);
-      break;
-    }
+// ── Settings panel ↔ active tile ───────────────────────────────────────────
+function setSetting(key, value) {
+  const tile = activeTile();
+  let v = value;
+  if (NUMERIC_KEYS.includes(key)) {
+    v = String(value).includes(".") ? parseFloat(value) : parseInt(value);
+    if (isNaN(v)) v = 0;
   }
-  return pts;
+  tile.settings = { ...tile.settings, [key]: v };
+  syncPanel(tile.settings);
 }
 
-// ── Map display ────────────────────────────────────────────────────────────
-function showMap(coords) {
-  if (!coords.length) return;
-
-  // Switch from drop inner to map container
-  dropInner.style.display = "none";
-  mapContainer.style.display = "block";
-
-  if (!leafletMap) {
-    leafletMap = L.map("mapContainer", { attributionControl: false, zoomControl: true });
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-    }).addTo(leafletMap);
+function syncPanel(s) {
+  for (const id of COLOR_KEYS) {
+    document.getElementById(id).value = s[id];
   }
-
-  if (routeLayer) {
-    leafletMap.removeLayer(routeLayer);
-    routeLayer = null;
+  for (const id of CHECKBOX_KEYS) {
+    document.getElementById(id).checked = !!s[id];
   }
-
-  routeLayer = L.polyline(coords, { color: "#e74c3c", weight: 3, opacity: 0.9 }).addTo(leafletMap);
-  leafletMap.fitBounds(routeLayer.getBounds(), { padding: [24, 24] });
-
-  // Add start/end markers
-  if (coords.length > 1) {
-    L.circleMarker(coords[0], { radius: 7, color: "#2ecc71", fillColor: "#2ecc71", fillOpacity: 0.9 })
-      .bindTooltip("Start").addTo(leafletMap);
-    L.circleMarker(coords[coords.length - 1], { radius: 7, color: "#e74c3c", fillColor: "#e74c3c", fillOpacity: 0.9 })
-      .bindTooltip("End").addTo(leafletMap);
-  }
-
-  // Force map resize
-  setTimeout(() => leafletMap.invalidateSize(), 50);
-}
-
-// ── Tile management ────────────────────────────────────────────────────────
-function updateTileUI(idx) {
-  const tileEl = document.getElementById(`tile${idx}`);
-  if (!tileEl) return;
-  const label = tileEl.querySelector(".tile-label");
-  if (label) label.textContent = tiles[idx].gpxName || "Tile " + (idx + 1);
-  tileEl.classList.add("active");
-}
-
-tileAdd.addEventListener("click", () => {
-  const idx = nextTileId++;
-  tiles.push({ gpxFile: null, gpxName: "Empty Tile", routeCoords: [] });
-
-  const el = document.createElement("div");
-  el.className = "tile tile-empty";
-  el.id = `tile${idx}`;
-  el.dataset.idx = idx;
-  el.innerHTML = `<span class="tile-label">Empty Tile</span>`;
-  el.addEventListener("click", () => setActiveTile(idx));
-  tileBar.insertBefore(el, tileAdd);
-
-  setActiveTile(idx);
-});
-
-function setActiveTile(idx) {
-  activeTileIdx = idx;
-  document.querySelectorAll(".tile-empty").forEach(t => t.classList.remove("active"));
-  const el = document.getElementById(`tile${idx}`);
-  if (el) el.classList.add("active");
-
-  // Show map or drop zone for this tile
-  const t = tiles[idx];
-  if (t && t.routeCoords.length > 0) {
-    showMap(t.routeCoords);
-  } else {
-    dropInner.style.display = "flex";
-    mapContainer.style.display = "none";
-  }
-}
-
-document.getElementById("tile0").addEventListener("click", () => setActiveTile(0));
-
-// ── Sliders ────────────────────────────────────────────────────────────────
-function bindSlider(sliderId, valId) {
-  const s = document.getElementById(sliderId);
-  const v = document.getElementById(valId);
-  if (!s || !v) return;
-  v.textContent = s.value;
-  s.addEventListener("input", () => { v.textContent = s.value; });
-}
-
-bindSlider("heightScale",   "heightScaleVal");
-bindSlider("trailWidth",    "trailWidthVal");
-bindSlider("trailHeight",   "trailHeightVal");
-bindSlider("baseThickness", "baseThicknessVal");
-bindSlider("trailBorder",   "trailBorderVal");
-bindSlider("baseSize",      "baseSizeVal");
-
-// ── Shape buttons ──────────────────────────────────────────────────────────
-document.querySelectorAll(".shape-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".shape-btn").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
+  document.querySelectorAll(".border-label").forEach(inp => {
+    inp.value = (s.borderLabels ?? [])[Number(inp.dataset.side)] ?? "";
   });
-});
 
-// ── Color pickers ──────────────────────────────────────────────────────────
-function bindColorBar(barId, inputId) {
-  const bar = document.getElementById(barId);
-  const inp = document.getElementById(inputId);
-  if (!bar || !inp) return;
-  bar.style.background = inp.value;
-  bar.addEventListener("click", () => inp.click());
-  inp.addEventListener("input", () => { bar.style.background = inp.value; });
+  // Paired range+number inputs
+  document.querySelectorAll("[data-setting]").forEach(inp => {
+    inp.value = s[inp.dataset.setting];
+  });
+
+  // Center radios
+  document.querySelectorAll("input[name='center']").forEach(r => {
+    r.checked = r.value === s.center;
+  });
+
+  // Shape buttons
+  document.querySelectorAll(".shape-button").forEach(b => {
+    b.classList.toggle("selected", b.dataset.shape === s.shape);
+  });
+
+  // Conditional buildings extras (site renders these only when enabled)
+  document.getElementById("buildingsExtra").hidden = !s.buildings;
 }
 
-bindColorBar("waterColorBar", "waterColor");
-bindColorBar("landColorBar",  "landColor");
-bindColorBar("rockColorBar",  "rockColor");
-bindColorBar("trailColorBar", "trailColor");
-
-// ── Collect settings ───────────────────────────────────────────────────────
-function collectSettings() {
-  const centerOn = document.querySelector("input[name='centerOn']:checked")?.value ?? "fit";
-  const shape    = document.querySelector(".shape-btn.active")?.dataset.shape ?? "square";
-
-  return {
-    include_seas:      document.getElementById("incSeas")?.checked   ?? true,
-    include_lakes:     document.getElementById("incLakes")?.checked  ?? true,
-    include_rivers:    document.getElementById("incRivers")?.checked ?? false,
-    print_separately:  document.getElementById("printSep")?.checked  ?? false,
-    include_buildings: document.getElementById("incBuildings")?.checked ?? false,
-    water_color:       document.getElementById("waterColor")?.value  ?? "#0055ff",
-    land_color:        document.getElementById("landColor")?.value   ?? "#00cc00",
-    rock_color:        document.getElementById("rockColor")?.value   ?? "#aaaaaa",
-    trail_color:       document.getElementById("trailColor")?.value  ?? "#ff0000",
-    tree_line:         parseFloat(document.getElementById("treeLine")?.value   ?? 1250),
-    height_scale:      parseFloat(document.getElementById("heightScale")?.value ?? 1),
-    trail_width:       parseFloat(document.getElementById("trailWidth")?.value  ?? 1),
-    trail_height:      parseFloat(document.getElementById("trailHeight")?.value ?? 1),
-    use_gpx_elevation: document.getElementById("useGPXEle")?.checked ?? false,
-    center_on:         centerOn,
-    shape:             shape,
-    base_thickness:    parseFloat(document.getElementById("baseThickness")?.value ?? 5),
-    trail_border:      parseFloat(document.getElementById("trailBorder")?.value  ?? 0.25),
-    base_size:         parseFloat(document.getElementById("baseSize")?.value     ?? 100),
-    stl_quality:       document.querySelector("input[name='stlQuality']:checked")?.value ?? "standard",
-    cache_id:          tiles[activeTileIdx]?.cacheId ?? null,
-  };
+function bindPanel() {
+  for (const id of COLOR_KEYS) {
+    document.getElementById(id).addEventListener("input", e => setSetting(id, e.target.value));
+  }
+  for (const id of CHECKBOX_KEYS) {
+    document.getElementById(id).addEventListener("change", e => setSetting(id, e.target.checked));
+  }
+  document.querySelectorAll(".border-label").forEach(inp => {
+    inp.addEventListener("input", e => {
+      const tile = activeTile();
+      const labels = [...(tile.settings.borderLabels ?? ["", "", "", "", "", ""])];
+      labels[Number(inp.dataset.side)] = e.target.value;
+      tile.settings = { ...tile.settings, borderLabels: labels };
+    });
+  });
+  document.querySelectorAll("[data-setting]").forEach(inp => {
+    inp.addEventListener("input", e => setSetting(inp.dataset.setting, e.target.value));
+  });
+  document.querySelectorAll("input[name='center']").forEach(r => {
+    r.addEventListener("change", () => setSetting("center", r.value));
+  });
+  document.querySelectorAll(".shape-button").forEach(b => {
+    b.addEventListener("click", () => setSetting("shape", b.dataset.shape));
+  });
 }
 
-// ── Preview 3D ─────────────────────────────────────────────────────────────
-document.getElementById("previewBtn").addEventListener("click", async () => {
-  const tile = tiles[activeTileIdx];
-  if (!tile?.gpxFile) {
-    alert("Por favor, carga un archivo GPX primero.");
-    return;
-  }
+// ── Tiles ──────────────────────────────────────────────────────────────────
+function tileName(tile) {
+  return tile.file.length > 0 ? tile.file[0].name : "Unnamed Trail";
+}
 
-  const btn = document.getElementById("previewBtn");
-  btn.disabled = true;
-  const settings = collectSettings();
-  const previewTimes = { standard: "~30 s", high: "~70 s", ultra: "~2–4 min" };
-  btn.textContent = `⏳ Cargando (${previewTimes[settings.stl_quality] ?? "~30 s"})…`;
-
-  try {
-    const fd = new FormData();
-    fd.append("gpx_file", tile.gpxFile);
-    fd.append("settings", JSON.stringify(settings));
-
-    const resp = await fetch("/api/preview-mesh", { method: "POST", body: fd });
-    if (!resp.ok) {
-      let msg = `Error ${resp.status}`;
-      try { msg = (await resp.json()).detail ?? msg; } catch (_) {}
-      throw new Error(msg);
+function renderTiles() {
+  tilesContainer.innerHTML = "";
+  for (const tile of tiles) {
+    const el = document.createElement("div");
+    el.className = "tile" + (tile.id === activeTileId ? " selected" : "");
+    const content = document.createElement("div");
+    content.className = "tile-content";
+    if (tile.path) {
+      const img = document.createElement("img");
+      img.className = "tile-preview";
+      img.src = `${API_BASE}/public/${tile.path}/image.png?${cacheKey}`;
+      img.alt = "Preview";
+      content.appendChild(img);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "tile-empty";
+      empty.textContent = "Empty Tile";
+      content.appendChild(empty);
     }
+    const hover = document.createElement("div");
+    hover.className = "tile-hover";
+    hover.textContent = tileName(tile);
+    content.appendChild(hover);
+    el.appendChild(content);
+    el.addEventListener("click", () => selectTile(tile.id));
+    tilesContainer.appendChild(el);
+  }
 
-    const data = await resp.json();
+  const add = document.createElement("div");
+  add.className = "tile add-tile";
+  add.innerHTML = `<div class="plus-icon">+</div>`;
+  add.addEventListener("click", () => {
+    const tile = makeTile(nextTileId++);
+    tiles.push(tile);
+    selectTile(tile.id);
+  });
+  tilesContainer.appendChild(add);
+}
 
-    // Cache the elevation ID so Download can skip re-fetching
-    tile.cacheId = data.cache_id;
+function selectTile(id) {
+  activeTileId = id;
+  syncPanel(activeTile().settings);
+  renderTiles();
+  refreshViewer();
+}
 
-    // Update stats bar
-    const stats = document.getElementById("previewStats");
-    if (stats) {
-      stats.textContent =
-        `Elevación: ${data.ele_min.toFixed(0)} m – ${data.ele_max.toFixed(0)} m  ·  ${data.gpx_count} puntos GPX`;
+// ── Main pane: dropzone ↔ inline 3D viewer ─────────────────────────────────
+async function refreshViewer() {
+  const tile = activeTile();
+  if (tile.path) {
+    dropzone.style.display = "none";
+    viewerCanvas.hidden = false;
+    try {
+      await window.Preview3D.renderJob({
+        base:        `${API_BASE}/public/${tile.path}`,
+        trailAmount: Math.max(1, tile.file.length),
+        settings:    tile.settings,
+        cacheKey,
+      });
+    } catch (err) {
+      showError("Could not load the 3D preview: " + err.message);
     }
-
-    window.Preview3D.render(data);
-    window.Preview3D.show();
-
-  } catch (err) {
-    alert("Error en la vista previa:\n" + err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "🏔️ Preview 3D";
+  } else {
+    viewerCanvas.hidden = true;
+    dropzone.style.display = "flex";
+    window.Preview3D?.clear();
   }
-});
+}
 
-// ── Download from inside the preview modal ─────────────────────────────────
-document.getElementById("downloadFromPreview").addEventListener("click", () => {
-  window.Preview3D.hide();
-  generateSTL();
-});
+// ── Upload / generate (site's M function) ──────────────────────────────────
+async function upload(newFiles, settingsOverride = null) {
+  const tile = activeTile();
 
-// ── Generate & download ────────────────────────────────────────────────────
-async function generateSTL() {
-  const tile = tiles[activeTileIdx];
-  if (!tile?.gpxFile) {
-    alert("Por favor, carga un archivo GPX primero.");
-    return;
-  }
-
-  const settings = collectSettings();
-
-  const qualityLabels = { standard: "~30 s", high: "~70 s", ultra: "~2–3 min" };
-  const qLabel = qualityLabels[settings.stl_quality] ?? "30–120 s";
   loadingOverlay.hidden = false;
-  loadingTitle.textContent = "Generando tu mapa 3D…";
-  loadingSub.textContent   = `Descargando datos de elevación (puede tardar ${qLabel})`;
+  loadingMessage.textContent = "Sending data to Server";
+
+  // Merge new files into the tile (dedupe by name), like the site does
+  tile.file = [
+    ...tile.file,
+    ...newFiles.filter(nf => !tile.file.some(f => f.name === nf.name)),
+  ];
+
+  const fd = new FormData();
+  if (tile.file.length > tile.fileHash.length || tile.fileHash.length === 0) {
+    tile.file.forEach(f => fd.append("file", f));
+  } else {
+    fd.append("fileHash", JSON.stringify(tile.fileHash));
+  }
+  fd.append("settings", JSON.stringify(settingsOverride || tile.settings));
 
   try {
-    const fd = new FormData();
-    fd.append("gpx_file", tile.gpxFile);
-    fd.append("settings", JSON.stringify(settings));
-
-    const resp = await fetch("/api/generate", { method: "POST", body: fd });
-
-    if (!resp.ok) {
-      let msg = `Error ${resp.status}`;
-      try { const j = await resp.json(); msg = j.detail || msg; } catch (_) {}
-      throw new Error(msg);
+    const resp = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
+    if (!resp.ok || !resp.body) {
+      showError("Error uploading the file. " + resp.status);
+      return;
     }
 
-    const blob = await resp.blob();
-    const cd   = resp.headers.get("Content-Disposition") ?? "";
-    const match = cd.match(/filename="?([^";]+)"?/);
-    const filename = match ? match[1] : (settings.print_separately ? "map3d.zip" : "map3d.stl");
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
 
-    const url = URL.createObjectURL(blob);
-    const a   = Object.assign(document.createElement("a"), { href: url, download: filename });
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.type === "info") {
+            loadingMessage.textContent = msg.message;
+          } else if (msg.type === "path") {
+            tile.path = msg.path;
+            tile.fileHash = msg.fileHash;
+          } else if (msg.type === "error") {
+            showError(msg.message);
+          } else {
+            showError("Server Error");
+          }
+        } catch (err) {
+          showError("Server Error");
+          console.error("Error parsing a JSON chunk:", err, line);
+        }
+      }
+    }
   } catch (err) {
-    alert("Error generando el modelo:\n" + err.message);
+    showError("Error sending the request: " + err);
   } finally {
     loadingOverlay.hidden = true;
+    loadingMessage.textContent = "";
+    cacheKey += 1;
+    clearUploadedList();
+    renderTiles();
+    refreshViewer();
   }
 }
 
-document.getElementById("downloadBtn").addEventListener("click", generateSTL);
-document.getElementById("updateBtn").addEventListener("click", generateSTL);
-document.getElementById("applyAllBtn").addEventListener("click", () => {
-  // In a future update: apply current settings to all tiles
-  alert("Configuración guardada. Se aplicará a todos los archivos al generar.");
+// ── Dropzones ──────────────────────────────────────────────────────────────
+function bindDropzone(zone, input, onFiles) {
+  zone.addEventListener("click", () => input.click());
+  ["dragover", "dragenter"].forEach(evt =>
+    zone.addEventListener(evt, e => { e.preventDefault(); zone.classList.add("active"); })
+  );
+  ["dragleave", "dragend"].forEach(evt =>
+    zone.addEventListener(evt, () => zone.classList.remove("active"))
+  );
+  zone.addEventListener("drop", e => {
+    e.preventDefault();
+    zone.classList.remove("active");
+    const files = Array.from(e.dataTransfer.files).filter(f => /\.gpx$/i.test(f.name));
+    if (files.length) onFiles(files);
+  });
+  input.addEventListener("change", e => {
+    const files = Array.from(e.target.files);
+    if (files.length) onFiles(files);
+    input.value = "";
+  });
+}
+
+// Main dropzone: dropping files starts generation immediately (site behavior)
+bindDropzone(dropzone, fileInput, files => upload(files));
+
+// "Add trail" dropzone: appends files to the tile; generation happens on Update
+bindDropzone(addTrailDrop, addTrailInput, files => {
+  const tile = activeTile();
+  tile.file = [
+    ...tile.file,
+    ...files.filter(nf => !tile.file.some(f => f.name === nf.name)),
+  ];
+  const ul = uploadedList.querySelector("ul");
+  for (const f of files) {
+    const li = document.createElement("li");
+    li.textContent = f.name;
+    ul.appendChild(li);
+  }
+  uploadedList.hidden = false;
 });
+
+function clearUploadedList() {
+  uploadedList.querySelector("ul").innerHTML = "";
+  uploadedList.hidden = true;
+}
+
+// ── Buttons ────────────────────────────────────────────────────────────────
+document.getElementById("updateBtn").addEventListener("click", async () => {
+  const tile = activeTile();
+  if (tile.file.length === 0 && tile.fileHash.length === 0) {
+    showError("Please load a GPX file first.");
+    return;
+  }
+  await upload(tile.file);
+});
+
+document.getElementById("downloadBtn").addEventListener("click", async () => {
+  const tile = activeTile();
+  if (!tile.path) {
+    showError("Please load a GPX file and generate the map first.");
+    return;
+  }
+  let name = tile.file[0]?.name || "unnamed";
+  if (name.endsWith(".gpx")) name = name.slice(0, -4);
+
+  try {
+    const resp = await fetch(`${API_BASE}/download/${tile.path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!resp.ok) throw new Error("Download failed");
+
+    const blob = await resp.blob();
+    const url  = window.URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url;
+    a.download = `${name}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  } catch (err) {
+    showError("Error downloading: " + err.message);
+  }
+});
+
+// Copies the active tile's settings to every tile (site behavior)
+document.getElementById("applyAllBtn").addEventListener("click", () => {
+  const s = { ...activeTile().settings };
+  tiles = tiles.map(t => ({ ...t, settings: { ...s } }));
+});
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+bindPanel();
+syncPanel(activeTile().settings);
+renderTiles();

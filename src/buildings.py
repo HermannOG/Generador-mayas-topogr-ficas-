@@ -1,6 +1,4 @@
-import time
-
-import overpy
+from src.overpass import index_elements, query_overpass, way_coords
 
 
 def fetch_buildings(lat_min, lat_max, lon_min, lon_max, max_buildings=2000):
@@ -10,7 +8,6 @@ def fetch_buildings(lat_min, lat_max, lon_min, lon_max, max_buildings=2000):
     Returns:
         list of dicts: {coords: [(lat, lon)...], height_tag: str|None}
     """
-    api = overpy.Overpass()
     query = f"""
     [out:json][timeout:60];
     (
@@ -21,24 +18,19 @@ def fetch_buildings(lat_min, lat_max, lon_min, lon_max, max_buildings=2000):
     out skel qt;
     """
 
-    for attempt in range(3):
-        try:
-            result = api.query(query)
-            buildings = []
-            for way in result.ways[:max_buildings]:
-                try:
-                    coords = [(float(n.lat), float(n.lon)) for n in way.nodes]
-                    if len(coords) < 3:
-                        continue
-                    height = way.tags.get(
-                        "height", way.tags.get("building:levels", None)
-                    )
-                    buildings.append({"coords": coords, "height_tag": height})
-                except Exception:
-                    continue
-            return buildings
-        except Exception:
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+    try:
+        data = query_overpass(query)
+    except Exception:
+        return []
 
-    return []
+    nodes, ways, _ = index_elements(data)
+
+    buildings = []
+    for way in list(ways.values())[:max_buildings]:
+        coords = way_coords(way, nodes)
+        if len(coords) < 3:
+            continue
+        tags = way.get("tags", {})
+        height = tags.get("height", tags.get("building:levels", None))
+        buildings.append({"coords": coords, "height_tag": height})
+    return buildings

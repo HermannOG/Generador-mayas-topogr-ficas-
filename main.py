@@ -1,58 +1,266 @@
 """
 Topo Trail Generator – FastAPI backend
+
+API contract aligned with topotrail.com:
+
+  POST /api/upload            multipart: file* (GPX, repeatable) OR fileHash
+                              (JSON list of hashes of already-uploaded files),
+                              plus settings (JSON, camelCase schema).
+                              Streams NDJSON progress lines:
+                                {"type":"info","message": "..."}
+                                {"type":"path","path": <jobId>, "fileHash":[...]}
+                                {"type":"error","message": "..."}
+                              The server generates ALL assets up front.
+
+  GET  /api/public/{job}/…    generated assets for the browser viewer:
+                              terrain.obj, trail{i}.obj, image.png, meta.json
+                              (plus the printable STLs).
+
+  POST /api/download/{job}    body {"name": str} → ZIP with printable STLs.
 """
 
+import asyncio
+import hashlib
 import io
 import json
-import math
+import shutil
+import time
 import uuid as uuid_module
 import zipfile
-from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+import numpy as np
+
 from src.buildings import fetch_buildings
-from src.gpx_handler import get_gpx_bounds, parse_gpx
+from src.gpx_handler import get_gpx_bounds, is_swim, parse_gpx_with_type
 from src.mesh_generator import MeshGenerator
+from src.render_preview import render_preview_png
 from src.terrain import fetch_elevation_grid
 from src.water import fetch_water_bodies
 
-# In-memory cache: stores elevation grids from /api/preview for reuse in /api/generate
-_preview_cache: dict = {}
-_CACHE_TTL = 600  # seconds
+GENERATED_DIR = Path("generated")
+GPX_STORE     = GENERATED_DIR / "gpx"
+JOB_TTL_S     = 24 * 3600
+
+# Same settings schema and defaults as the topotrail.com front-end
+DEFAULT_SETTINGS = {
+    "waterColor":            "#0084ff",
+    "landColor":             "#00FF00",
+    "trackColor":            "#FC5200",
+    "rockColor":             "#BDBDBD",
+    "treeLine":              1250,
+    "heightScale":           1,
+    "trailWidth":            1,
+    "trailHeight":           1,
+    "useHeightFromGpx":      False,
+    "shape":                 "hexagon",
+    "distanceTrackToBorder": 0.25,
+    "baseThickness":         5,
+    "includeSeas":           True,
+    "includeLakes":          True,
+    "includeRivers":         False,
+    "base_size":             100,
+    "center":                "normal",
+    "buildings":             False,
+    "building_scale":        1,
+    "buildingsColor":        "#777777",
+    "higherResolution":      False,
+    "singleColor":           False,
+    "singleColor_gap":       0.5,
+    # TopoTrail extensions (not on topotrail.com): hexagon border with text
+    "baseColor":             "#FFFFFF",
+    "textColor":             "#000000",
+    "borderLabels":          ["", "", "", "", "", ""],
+    # order: top, upper-right, lower-right, bottom, lower-left, upper-left
+}
+
+# Legacy snake_case names (old front-end) still accepted as fallbacks
+LEGACY_KEYS = {
+    "waterColor":            "water_color",
+    "landColor":             "land_color",
+    "trackColor":            "trail_color",
+    "rockColor":             "rock_color",
+    "treeLine":              "tree_line",
+    "heightScale":           "height_scale",
+    "trailWidth":            "trail_width",
+    "trailHeight":           "trail_height",
+    "useHeightFromGpx":      "use_gpx_elevation",
+    "distanceTrackToBorder": "trail_border",
+    "baseThickness":         "base_thickness",
+    "includeSeas":           "include_seas",
+    "includeLakes":          "include_lakes",
+    "includeRivers":         "include_rivers",
+    "center":                "center_on",
+    "buildings":             "include_buildings",
+    "singleColor":           "print_separately",
+}
 
 
-def _cache_store(grid, lat_b, lon_b) -> str:
-    cid = str(uuid_module.uuid4())
-    _preview_cache[cid] = {"grid": grid, "lat_b": lat_b, "lon_b": lon_b, "ts": datetime.now()}
-    # Evict stale entries
-    now = datetime.now()
-    stale = [k for k, v in list(_preview_cache.items()) if (now - v["ts"]).total_seconds() > _CACHE_TTL]
-    for k in stale:
-        del _preview_cache[k]
-    return cid
+def normalize_settings(raw: dict) -> dict:
+    cfg = dict(DEFAULT_SETTINGS)
+    for key in DEFAULT_SETTINGS:
+        if key in raw:
+            cfg[key] = raw[key]
+        elif LEGACY_KEYS.get(key) in raw:
+            cfg[key] = raw[LEGACY_KEYS[key]]
+    return cfg
 
 
 def _resolve_center(cfg, points, bounds):
-    """Return (lat_c, lon_c, size_km) based on center_on setting."""
-    center_on = cfg.get("center_on", "fit")
+    """Return (lat_c, lon_c) based on the `center` setting."""
+    center = cfg.get("center", "normal")
     lat_c = bounds["lat_center"]
     lon_c = bounds["lon_center"]
-    if center_on == "start" and points:
+    if center == "start" and points:
         lat_c, lon_c = points[0][0], points[0][1]
-    elif center_on == "end" and points:
+    elif center == "end" and points:
         lat_c, lon_c = points[-1][0], points[-1][1]
-    elif center_on == "highest" and points:
+    elif center in ("highestPoint", "highest") and points:
         hp = max(points, key=lambda p: p[2])
         lat_c, lon_c = hp[0], hp[1]
-    elif center_on == "furthest" and points:
+    elif center in ("furthestAway", "furthest") and points:
         s = points[0]
         fp = max(points, key=lambda p: (p[0] - s[0]) ** 2 + (p[1] - s[1]) ** 2)
         lat_c, lon_c = fp[0], fp[1]
-    return lat_c, lon_c, bounds["size_km"]
+    return lat_c, lon_c
+
+
+def _cleanup_old_jobs():
+    if not GENERATED_DIR.exists():
+        return
+    now = time.time()
+    for d in GENERATED_DIR.iterdir():
+        if d.is_dir() and d.name != "gpx" and now - d.stat().st_mtime > JOB_TTL_S:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
+    """
+    Blocking generation pipeline: elevation → water/buildings → meshes → assets.
+    trails: list of {"points": [(lat, lon, ele)...], "flat": bool} per GPX file
+            (flat=True for swims — the ribbon stays at one height).
+    progress(msg): callback for user-facing status messages.
+    """
+    all_points = [p for t in trails for p in t["points"]]
+    bounds = get_gpx_bounds(all_points)
+    if not bounds:
+        raise ValueError("Could not compute bounds from the GPX files")
+
+    lat_c, lon_c = _resolve_center(cfg, all_points, bounds)
+
+    labels = [str(x) for x in (cfg.get("borderLabels") or [])][:6]
+    has_labels = any(x.strip() for x in labels)
+    base_size = float(cfg["base_size"])
+    border_mm = max(6.0, 0.08 * base_size) if has_labels else 0.0
+
+    # Trail-to-border margin: never closer than 5% of the model per side;
+    # the "Distance Trail to Border" slider (0–1) adds up to +50% on top.
+    knob = min(1.0, max(0.0, float(cfg["distanceTrackToBorder"])))
+    margin = 0.05 + 0.5 * knob
+    size_km = bounds["span_km"] * (1.0 + 2.0 * margin)
+    if border_mm:
+        # The border ring shrinks the terrain shape — zoom out to compensate
+        r_mm = 0.49 * base_size
+        size_km *= r_mm / max(r_mm - border_mm, 1e-6)
+
+    resolution = 300 if cfg["higherResolution"] else 200
+
+    progress("Downloading elevation data")
+    grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
+
+    water_data = None
+    if cfg["includeSeas"] or cfg["includeLakes"] or cfg["includeRivers"]:
+        progress("Downloading water features")
+        try:
+            all_water = fetch_water_bodies(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
+            water_data = [
+                w for w in all_water
+                if (w["type"] == "lake"  and cfg["includeLakes"])
+                or (w["type"] == "sea"   and cfg["includeSeas"])
+                or (w["type"] == "river" and cfg["includeRivers"])
+            ]
+        except Exception:
+            water_data = None
+
+    buildings_data = None
+    if cfg["buildings"]:
+        progress("Downloading buildings")
+        try:
+            buildings_data = fetch_buildings(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
+        except Exception:
+            buildings_data = None
+
+    progress("Generating 3D mesh")
+    height_scale = max(0.1, float(cfg["heightScale"]))
+    gen = MeshGenerator({
+        "target_size_mm":     base_size,
+        "base_thickness_mm":  float(cfg["baseThickness"]),
+        "max_ele_height_mm":  20.0 * height_scale,
+        "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
+        "route_width_mm":     float(cfg["trailWidth"]),
+        "route_height_mm":    float(cfg["trailHeight"]),
+        "shape":              cfg["shape"],
+        "border_mm":          border_mm,
+        "border_labels":      labels,
+    })
+
+    # For open seas/bays, SRTM returns ~0 m — use elevation threshold
+    detect_ocean_m = 0.5 if cfg["includeSeas"] else None
+    tree_line_m = float(cfg["treeLine"])
+
+    zones = gen.generate_zone_tris(
+        grid, lat_b, lon_b,
+        buildings=buildings_data, water=water_data,
+        tree_line_m=tree_line_m, detect_ocean_m=detect_ocean_m,
+    )
+    trail_tris = [gen.route_tris(t["points"], flat=t["flat"]) for t in trails]
+    zones.update(gen.border_tris())   # "base" slab + raised "text" labels
+
+    progress("Writing model files")
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Viewer assets: terrain.obj (zone groups) + one trail{i}.obj per GPX file
+    (job_dir / "terrain.obj").write_bytes(gen.to_obj_bytes(zones))
+    for i, tris in enumerate(trail_tris):
+        (job_dir / f"trail{i}.obj").write_bytes(gen.to_obj_bytes({"trail": tris}))
+
+    # Printable STLs: combined map + separate terrain/trails for multi-filament
+    terrain_tris = (zones["land"] + zones["rock"] + zones["water"]
+                    + zones["buildings"] + zones["base"] + zones["text"])
+    all_trail_tris = [t for tris in trail_tris for t in tris]
+    (job_dir / "map.stl").write_bytes(gen.to_stl_bytes(terrain_tris + all_trail_tris))
+    (job_dir / "terrain.stl").write_bytes(gen.to_stl_bytes(terrain_tris))
+    for i, tris in enumerate(trail_tris):
+        (job_dir / f"trail{i}.stl").write_bytes(gen.to_stl_bytes(tris))
+
+    # Tile thumbnail
+    render_preview_png(
+        grid, gen.last_water_mask, lat_b, lon_b,
+        [t["points"] for t in trails],
+        tree_line_m,
+        {
+            "land":  cfg["landColor"],
+            "rock":  cfg["rockColor"],
+            "water": cfg["waterColor"],
+            "track": cfg["trackColor"],
+        },
+        job_dir / "image.png",
+    )
+
+    (job_dir / "meta.json").write_text(json.dumps({
+        "settings":    cfg,
+        "trailAmount": len(trails),
+        "eleMin":      float(grid.min()),
+        "eleMax":      float(grid.max()),
+        "gpxCount":    len(all_points),
+    }))
+
 
 app = FastAPI(title="Topo Trail Generator")
 app.add_middleware(
@@ -68,279 +276,139 @@ async def index():
     return FileResponse("static/index.html")
 
 
-# ── Preview endpoint ──────────────────────────────────────────────────────────
-@app.post("/api/preview")
-async def preview_endpoint(
-    gpx_file: UploadFile = File(...),
+# ── Upload / generate endpoint ────────────────────────────────────────────────
+@app.post("/api/upload")
+async def upload(
+    file: Optional[List[UploadFile]] = File(None),
+    fileHash: Optional[str] = Form(None),
     settings: str = Form("{}"),
 ):
-    """Return elevation grid as JSON for the 3D browser preview."""
-    cfg = json.loads(settings)
-    content = await gpx_file.read()
-
     try:
-        points = parse_gpx(content)
-    except Exception as exc:
-        raise HTTPException(400, f"GPX inválido: {exc}")
-    if not points:
-        raise HTTPException(400, "No se encontraron puntos en el GPX")
+        cfg = normalize_settings(json.loads(settings))
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid settings JSON")
 
-    bounds = get_gpx_bounds(points)
-    if not bounds:
-        raise HTTPException(400, "No se pueden calcular los límites")
+    # Resolve GPX contents: new uploads and/or previously stored hashes
+    GPX_STORE.mkdir(parents=True, exist_ok=True)
+    contents: list[bytes] = []
+    hashes:   list[str]   = []
 
-    lat_c, lon_c, size_km = _resolve_center(cfg, points, bounds)
-    resolution = 40  # lower res for fast preview (~9 API calls)
+    if file:
+        for up in file:
+            data = await up.read()
+            h = hashlib.sha256(data).hexdigest()
+            (GPX_STORE / f"{h}.gpx").write_bytes(data)
+            contents.append(data)
+            hashes.append(h)
 
-    try:
-        grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
-    except Exception as exc:
-        raise HTTPException(500, f"Error descargando elevación: {exc}")
-
-    cache_id = _cache_store(grid, lat_b, lon_b)
-
-    # Filter + decimate GPX points to max 600 for JSON size
-    gpx_in = [
-        [p[0], p[1], float(p[2])] for p in points
-        if lat_b[0] <= p[0] <= lat_b[1] and lon_b[0] <= p[1] <= lon_b[1]
-    ]
-    if len(gpx_in) > 600:
-        step = max(1, len(gpx_in) // 600)
-        gpx_in = gpx_in[::step]
-
-    return JSONResponse({
-        "cache_id":  cache_id,
-        "grid":      grid.tolist(),
-        "lat_bounds": list(lat_b),
-        "lon_bounds": list(lon_b),
-        "ele_min":   float(grid.min()),
-        "ele_max":   float(grid.max()),
-        "gpx_points": gpx_in,
-        "settings": {
-            "land_color":  cfg.get("land_color",  "#00cc00"),
-            "rock_color":  cfg.get("rock_color",  "#aaaaaa"),
-            "water_color": cfg.get("water_color", "#0055ff"),
-            "trail_color": cfg.get("trail_color", "#ff0000"),
-            "tree_line":   float(cfg.get("tree_line", 1250)),
-        },
-    })
-
-
-# ── Preview-mesh endpoint (real STL geometry, split by colour zone) ───────────
-@app.post("/api/preview-mesh")
-async def preview_mesh_endpoint(
-    gpx_file: UploadFile = File(...),
-    settings: str = Form("{}"),
-):
-    """
-    Returns base64-encoded binary STL for each colour zone (land/rock/trail).
-    Uses the same MeshGenerator as /api/generate, just at lower resolution.
-    """
-    cfg = json.loads(settings)
-    content = await gpx_file.read()
-
-    try:
-        points = parse_gpx(content)
-    except Exception as exc:
-        raise HTTPException(400, f"GPX inválido: {exc}")
-    if not points:
-        raise HTTPException(400, "No se encontraron puntos")
-
-    bounds = get_gpx_bounds(points)
-    if not bounds:
-        raise HTTPException(400, "No se pueden calcular límites")
-
-    lat_c, lon_c, size_km = _resolve_center(cfg, points, bounds)
-    resolution = {"standard": 50, "high": 70, "ultra": 100}.get(
-        cfg.get("stl_quality", "standard"), 50
-    )
-
-    try:
-        grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
-    except Exception as exc:
-        raise HTTPException(500, f"Error descargando elevación: {exc}")
-
-    cache_id = _cache_store(grid, lat_b, lon_b)
-
-    height_scale = max(0.1, float(cfg.get("height_scale", 1.0)))
-    mesh_cfg = {
-        "target_size_mm":    float(cfg.get("base_size",       100)),
-        "base_thickness_mm": float(cfg.get("base_thickness",    5.0)),
-        "max_ele_height_mm": 20.0 * height_scale,
-        "building_height_mm": 2.0,
-        "route_width_mm":    float(cfg.get("trail_width",      1.0)),
-        "route_height_mm":   float(cfg.get("trail_height",     1.0)),
-        "shape":             cfg.get("shape", "square"),
-    }
-    tree_line_m = float(cfg.get("tree_line", 1250))
-
-    # ── Fetch water bodies ────────────────────────────────────────────────
-    water_data = None
-    if cfg.get("include_lakes") or cfg.get("include_rivers") or cfg.get("include_seas"):
+    if not contents and fileHash:
         try:
-            all_water = fetch_water_bodies(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-            water_data = [
-                w for w in all_water
-                if (
-                    (w["type"] == "lake"  and cfg.get("include_lakes",  True))
-                    or (w["type"] == "sea"   and cfg.get("include_seas",   True))
-                    or (w["type"] == "river" and cfg.get("include_rivers", False))
-                )
-            ]
-        except Exception:
-            water_data = None
+            requested = json.loads(fileHash)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "Invalid fileHash JSON")
+        for h in requested:
+            p = GPX_STORE / f"{Path(str(h)).name}.gpx"
+            if not p.exists():
+                raise HTTPException(410, f"Cached GPX no longer available: {h}")
+            contents.append(p.read_bytes())
+            hashes.append(str(h))
 
-    # For open seas/bays, SRTM returns ~0 m — use elevation threshold
-    detect_ocean_m = 0.5 if cfg.get("include_seas", True) else None
+    if not contents:
+        raise HTTPException(400, "No GPX file or fileHash provided")
 
-    try:
-        gen = MeshGenerator(mesh_cfg)
-        components = gen.generate_components_b64(
-            grid, lat_b, lon_b,
-            gpx_points=points,
-            tree_line_m=tree_line_m,
-            water=water_data,
-            detect_ocean_m=detect_ocean_m,
-        )
-    except Exception as exc:
-        import traceback; traceback.print_exc()
-        raise HTTPException(500, f"Error generando malla: {exc}")
+    async def stream():
+        def line(obj):
+            return json.dumps(obj) + "\n"
 
-    return JSONResponse({
-        "cache_id":   cache_id,
-        "components": components,
-        "ele_min":    float(grid.min()),
-        "ele_max":    float(grid.max()),
-        "gpx_count":  len(points),
-        "settings": {
-            "land_color":  cfg.get("land_color",  "#00cc00"),
-            "rock_color":  cfg.get("rock_color",  "#aaaaaa"),
-            "water_color": cfg.get("water_color", "#0055ff"),
-            "trail_color": cfg.get("trail_color", "#ff0000"),
-            "tree_line":   tree_line_m,
-        },
-    })
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
 
+        def progress(msg):
+            loop.call_soon_threadsafe(queue.put_nowait, msg)
 
-# ── Generate endpoint ─────────────────────────────────────────────────────────
-@app.post("/api/generate")
-async def generate(
-    gpx_file: UploadFile = File(...),
-    settings: str = Form("{}"),
-):
-    cfg = json.loads(settings)
-
-    # ── Parse GPX ────────────────────────────────────────────────────────
-    content = await gpx_file.read()
-    try:
-        points = parse_gpx(content)
-    except Exception as exc:
-        raise HTTPException(400, f"GPX inválido: {exc}")
-
-    if not points:
-        raise HTTPException(400, "No se encontraron puntos en el archivo GPX")
-
-    bounds = get_gpx_bounds(points)
-    if not bounds:
-        raise HTTPException(400, "No se pueden calcular los límites del GPX")
-
-    # ── Center selection ──────────────────────────────────────────────────
-    lat_c, lon_c, _ = _resolve_center(cfg, points, bounds)
-
-    size_km = bounds["size_km"]
-    resolution = {"standard": 50, "high": 70, "ultra": 100}.get(
-        cfg.get("stl_quality", "standard"), 50
-    )
-
-    # ── Fetch elevation (reuse cached preview grid if available) ──────────
-    cache_id = cfg.get("cache_id")
-    if cache_id and cache_id in _preview_cache:
-        cached = _preview_cache[cache_id]
-        grid, lat_b, lon_b = cached["grid"], cached["lat_b"], cached["lon_b"]
-    else:
+        yield line({"type": "info", "message": "Parsing GPX files"})
         try:
-            grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
+            trails = []
+            for data in contents:
+                pts, activity = parse_gpx_with_type(data)
+                if not pts:
+                    continue
+                flat = is_swim(activity)
+                if flat:
+                    # Swims are flat water: GPS elevation is noise, use median
+                    med = float(np.median([p[2] for p in pts]))
+                    pts = [(p[0], p[1], med) for p in pts]
+                trails.append({"points": pts, "flat": flat})
+            if not trails:
+                yield line({"type": "error", "message": "No points found in the GPX files"})
+                return
+
+            _cleanup_old_jobs()
+            job_id = uuid_module.uuid4().hex[:12]
+            job_dir = GENERATED_DIR / job_id
+
+            task = asyncio.create_task(
+                asyncio.to_thread(_generate_job, job_dir, trails, cfg, progress)
+            )
+            while not task.done():
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield line({"type": "info", "message": msg})
+                except asyncio.TimeoutError:
+                    pass
+            task.result()  # re-raise generation errors
+
+            while not queue.empty():
+                yield line({"type": "info", "message": queue.get_nowait()})
+            yield line({"type": "path", "path": job_id, "fileHash": hashes})
+
         except Exception as exc:
-            raise HTTPException(500, f"Error descargando elevación: {exc}")
+            import traceback
+            traceback.print_exc()
+            yield line({"type": "error", "message": f"Error generating map: {exc}"})
 
-    # ── Optional: water features ──────────────────────────────────────────
-    water_data = None
-    if cfg.get("include_lakes") or cfg.get("include_rivers") or cfg.get("include_seas"):
-        try:
-            all_water = fetch_water_bodies(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-            water_data = [
-                w for w in all_water
-                if (
-                    (w["type"] == "lake" and cfg.get("include_lakes", True))
-                    or (w["type"] == "sea" and cfg.get("include_seas", True))
-                    or (w["type"] == "river" and cfg.get("include_rivers", False))
-                )
-            ]
-        except Exception:
-            water_data = None
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
-    # ── Optional: buildings ───────────────────────────────────────────────
-    buildings_data = None
-    if cfg.get("include_buildings"):
-        try:
-            buildings_data = fetch_buildings(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-        except Exception:
-            buildings_data = None
 
-    # ── Mesh config ───────────────────────────────────────────────────────
-    height_scale = max(0.1, float(cfg.get("height_scale", 1.0)))
-    mesh_cfg = {
-        "target_size_mm":    float(cfg.get("base_size", 100)),
-        "base_thickness_mm": float(cfg.get("base_thickness", 5.0)),
-        "max_ele_height_mm": 20.0 * height_scale,
-        "building_height_mm": 2.0,
-        "route_width_mm":    float(cfg.get("trail_width", 1.0)),
-        "route_height_mm":   float(cfg.get("trail_height", 1.0)),
-        "shape":             cfg.get("shape", "square"),
-        "tree_line_m":       float(cfg.get("tree_line", 1250)),
-    }
+# ── Download endpoint ─────────────────────────────────────────────────────────
+@app.post("/api/download/{job_id}")
+async def download(job_id: str, body: dict):
+    job_dir = GENERATED_DIR / Path(job_id).name
+    meta_path = job_dir / "meta.json"
+    if not job_dir.is_dir() or not meta_path.exists():
+        raise HTTPException(404, "Unknown or expired job")
 
-    gen = MeshGenerator(mesh_cfg)
-    detect_ocean_m = 0.5 if cfg.get("include_seas", True) else None
+    meta = json.loads(meta_path.read_text())
+    name = str(body.get("name") or "map3d").strip() or "map3d"
 
-    # ── Generate ──────────────────────────────────────────────────────────
-    try:
-        if cfg.get("print_separately"):
-            terrain_bytes = gen.generate_bytes(
-                grid, lat_b, lon_b,
-                buildings=buildings_data, water=water_data, gpx_points=None,
-                detect_ocean_m=detect_ocean_m,
-            )
-            trail_bytes = gen.generate_trail_only_bytes(grid, lat_b, lon_b, gpx_points=points)
+    # singleColor → separate terrain + trail STLs for filament swaps;
+    # otherwise a single combined STL.
+    if meta["settings"].get("singleColor"):
+        files = [("terrain.stl", f"{name}_terrain.stl")] + [
+            (f"trail{i}.stl", f"{name}_trail{i}.stl")
+            for i in range(meta.get("trailAmount", 1))
+        ]
+    else:
+        files = [("map.stl", f"{name}.stl")]
 
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("terrain.stl", terrain_bytes)
-                zf.writestr("trail.stl", trail_bytes)
-            zip_buf.seek(0)
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for src, arcname in files:
+            p = job_dir / src
+            if p.exists():
+                zf.write(p, arcname)
+    zip_buf.seek(0)
 
-            return StreamingResponse(
-                zip_buf,
-                media_type="application/zip",
-                headers={"Content-Disposition": 'attachment; filename="map3d.zip"'},
-            )
-        else:
-            stl_bytes = gen.generate_bytes(
-                grid, lat_b, lon_b,
-                buildings=buildings_data, water=water_data, gpx_points=points,
-                detect_ocean_m=detect_ocean_m,
-            )
-            return StreamingResponse(
-                io.BytesIO(stl_bytes),
-                media_type="application/octet-stream",
-                headers={"Content-Disposition": 'attachment; filename="map3d.stl"'},
-            )
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+    )
 
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"Error generando malla: {exc}")
 
+# Generated assets (terrain.obj, trail{i}.obj, image.png, meta.json, STLs)
+GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/api/public", StaticFiles(directory=GENERATED_DIR), name="public")
 
 # Static files – mounted last so API routes take priority
 app.mount("/static", StaticFiles(directory="static"), name="static")

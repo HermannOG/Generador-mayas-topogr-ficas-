@@ -1,25 +1,23 @@
 /**
- * preview3d.js – renders the real STL mesh geometry in the browser.
- * Uses Three.js STLLoader so the preview looks exactly like the 3D-printed model.
- * Exposes: window.Preview3D = { render, show, hide, getData }
+ * preview3d.js – inline 3D viewer for the main pane (mirrors the
+ * topotrail.com viewer, which shows the generated model directly in the
+ * top-left area). Loads the OBJ assets produced by /api/upload:
+ * terrain.obj (one object per colour zone) + trail{i}.obj per GPX file.
+ * Exposes: window.Preview3D = { renderJob, clear }
  */
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { STLLoader }     from "three/addons/loaders/STLLoader.js";
+import { OBJLoader }     from "three/addons/loaders/OBJLoader.js";
 
-// ── Scene state ───────────────────────────────────────────────────────────────
 let renderer, scene, camera, controls;
 let animId = null;
-let currentData = null;
-let wireframeActive = false;
-let geoGroup = null;          // Group that holds the model meshes (easy to clear)
+let geoGroup = null;
 
-const loader = new STLLoader();
+const loader = new OBJLoader();
 
-// ── Init ──────────────────────────────────────────────────────────────────────
 function initScene() {
-  const canvas = document.getElementById("previewCanvas");
+  const canvas = document.getElementById("viewerCanvas");
 
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -37,7 +35,6 @@ function initScene() {
   controls.minDistance   = 5;
   controls.maxDistance   = 600;
 
-  // Soft ambient + angled sun for good topographic shading
   scene.add(new THREE.AmbientLight(0xffffff, 0.50));
 
   const sun = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -53,78 +50,75 @@ function initScene() {
   scene.add(fill);
 }
 
-// ── Resize ────────────────────────────────────────────────────────────────────
 function resizeRenderer() {
   const c = renderer.domElement;
   const w = c.clientWidth, h = c.clientHeight;
-  if (c.width !== w || c.height !== h) {
+  if (w > 0 && h > 0 && (c.width !== w || c.height !== h)) {
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
   }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function b64toArrayBuffer(b64) {
-  const bin = atob(b64);
-  const buf = new ArrayBuffer(bin.length);
-  const arr = new Uint8Array(buf);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return buf;
-}
-
-function makeMesh(b64, colorHex) {
-  if (!b64) return null;
-  const geom = loader.parse(b64toArrayBuffer(b64));
-  if (!geom || geom.attributes.position.count === 0) return null;
-  geom.computeVertexNormals();
-  const mat = new THREE.MeshPhongMaterial({
+function makeMaterial(colorHex) {
+  return new THREE.MeshPhongMaterial({
     color:     new THREE.Color(colorHex),
     shininess: 12,
     specular:  new THREE.Color(0x111111),
     side:      THREE.DoubleSide,
   });
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.castShadow    = true;
-  mesh.receiveShadow = true;
-  return mesh;
 }
 
-// ── Render real STL geometry ──────────────────────────────────────────────────
-function renderPreview(data) {
-  // Remove previous model
+function applyColors(objRoot, colorByName, fallback) {
+  objRoot.traverse(obj => {
+    if (!obj.isMesh) return;
+    const colorHex = colorByName[obj.name] ?? fallback;
+    obj.material = makeMaterial(colorHex);
+    obj.geometry.computeVertexNormals();
+    obj.castShadow    = true;
+    obj.receiveShadow = true;
+  });
+}
+
+async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
   if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
-  wireframeActive = false;
-  document.getElementById("wireframeToggle")?.classList.remove("active");
 
-  const s = data.settings ?? {};
-  const landColor  = s.land_color  ?? "#00cc00";
-  const rockColor  = s.rock_color  ?? "#aaaaaa";
-  const trailColor = s.trail_color ?? "#ff0000";
-  const waterColor = s.water_color ?? "#0055ff";
-
-  const comps = data.components ?? {};
-  const landMesh  = makeMesh(comps.land,  landColor);
-  const rockMesh  = makeMesh(comps.rock,  rockColor);
-  const trailMesh = makeMesh(comps.trail, trailColor);
-  const waterMesh = makeMesh(comps.water, waterColor);
-
-  if (!landMesh && !rockMesh) {
-    console.warn("Preview: no mesh data received");
-    return;
-  }
+  const landColor      = settings.landColor      ?? "#00FF00";
+  const rockColor      = settings.rockColor      ?? "#BDBDBD";
+  const trackColor     = settings.trackColor     ?? "#FC5200";
+  const waterColor     = settings.waterColor     ?? "#0084ff";
+  const buildingsColor = settings.buildingsColor ?? "#777777";
+  const baseColor      = settings.baseColor      ?? "#FFFFFF";
+  const textColor      = settings.textColor      ?? "#000000";
 
   geoGroup = new THREE.Group();
-  if (landMesh)  geoGroup.add(landMesh);
-  if (rockMesh)  geoGroup.add(rockMesh);
-  if (waterMesh) geoGroup.add(waterMesh);
-  if (trailMesh) geoGroup.add(trailMesh);
 
-  // Centre the model at origin
+  const terrain = await loader.loadAsync(`${base}/terrain.obj?v=${cacheKey}`);
+  applyColors(terrain, {
+    land:      landColor,
+    rock:      rockColor,
+    water:     waterColor,
+    buildings: buildingsColor,
+    base:      baseColor,
+    text:      textColor,
+  }, landColor);
+  geoGroup.add(terrain);
+
+  for (let i = 0; i < trailAmount; i++) {
+    try {
+      const trail = await loader.loadAsync(`${base}/trail${i}.obj?v=${cacheKey}`);
+      applyColors(trail, {}, trackColor);
+      geoGroup.add(trail);
+    } catch (_) {
+      // Trail file may be empty/missing when a GPX had no usable points
+    }
+  }
+
+  // Centre the model at origin, base on the ground plane
   const bbox = new THREE.Box3().setFromObject(geoGroup);
   const center = new THREE.Vector3();
   bbox.getCenter(center);
-  geoGroup.position.set(-center.x, -center.y, -bbox.min.z);  // Z base on ground
+  geoGroup.position.set(-center.x, -center.y, -bbox.min.z);
 
   scene.add(geoGroup);
 
@@ -133,28 +127,18 @@ function renderPreview(data) {
   bbox.getSize(size);
   const diag = size.length();
 
-  camera.position.set(
-    diag * -0.3,
-    diag * -0.75,
-    diag *  0.55,
-  );
+  camera.position.set(diag * -0.3, diag * -0.75, diag * 0.55);
   controls.target.set(0, 0, size.z * 0.35);
   controls.update();
 
-  currentData = data;
+  startAnimate();
 }
 
-// ── Wireframe ─────────────────────────────────────────────────────────────────
-function toggleWireframe() {
-  if (!geoGroup) return;
-  wireframeActive = !wireframeActive;
-  geoGroup.traverse(obj => {
-    if (obj.isMesh) obj.material.wireframe = wireframeActive;
-  });
-  document.getElementById("wireframeToggle")?.classList.toggle("active", wireframeActive);
+function clear() {
+  if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
+  stopAnimate();
 }
 
-// ── Animation loop ────────────────────────────────────────────────────────────
 function startAnimate() {
   if (animId) return;
   (function loop() {
@@ -169,37 +153,6 @@ function stopAnimate() {
   if (animId) { cancelAnimationFrame(animId); animId = null; }
 }
 
-// ── Show / hide ───────────────────────────────────────────────────────────────
-function showModal() {
-  document.getElementById("previewModal").hidden = false;
-  setTimeout(() => { resizeRenderer(); startAnimate(); }, 50);
-}
+window.addEventListener("DOMContentLoaded", initScene);
 
-function hideModal() {
-  stopAnimate();
-  document.getElementById("previewModal").hidden = true;
-}
-
-// ── Boot ──────────────────────────────────────────────────────────────────────
-window.addEventListener("DOMContentLoaded", () => {
-  initScene();
-
-  document.getElementById("closePreview")
-    .addEventListener("click", hideModal);
-  document.getElementById("wireframeToggle")
-    .addEventListener("click", toggleWireframe);
-  document.getElementById("previewBg")
-    .addEventListener("click", hideModal);
-
-  window.addEventListener("keydown", e => {
-    if (e.key === "Escape") hideModal();
-  });
-});
-
-// ── Public API ────────────────────────────────────────────────────────────────
-window.Preview3D = {
-  render:  renderPreview,
-  show:    showModal,
-  hide:    hideModal,
-  getData: () => currentData,
-};
+window.Preview3D = { renderJob, clear };
