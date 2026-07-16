@@ -13,7 +13,8 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter
+from scipy.ndimage import (binary_dilation, binary_erosion,
+                           distance_transform_edt, gaussian_filter)
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import triangulate as shp_triangulate
@@ -542,12 +543,17 @@ class MeshGenerator:
             elif len(w.get("coords", [])) >= 3:
                 (seas if w["type"] == "sea" else lakes).append(w)
 
-        # Lakes: each body flat at its own level; islands (hole rings)
-        # stay terrain.
+        # Lakes: each body flat at its own SHORELINE level; islands (hole
+        # rings) stay terrain. The shoreline (mask boundary) is the right
+        # water level — elevation data inside a reservoir can show the dry
+        # basin floor from before it was filled, and using that would sink
+        # the water far below the surrounding land.
         for lake in lakes:
             mask = self._mask_from_feature(lake, rows, cols)
             if mask.any():
-                out[mask] = float(np.median(grid[mask]))
+                boundary = mask & ~binary_erosion(mask)
+                level_cells = boundary if boundary.any() else mask
+                out[mask] = float(np.median(grid[level_cells]))
                 merged |= mask
 
         # Seas: flatten to the map minimum
