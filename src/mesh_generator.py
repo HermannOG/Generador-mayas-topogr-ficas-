@@ -43,7 +43,7 @@ class MeshGenerator:
     # ── Public API ────────────────────────────────────────────────────────
 
     def generate_zone_tris(self, elevation_grid, lat_bounds, lon_bounds,
-                           buildings=None, water=None,
+                           buildings=None, water=None, forests=None,
                            tree_line_m=1250.0, detect_ocean_m=None):
         """
         Generate terrain geometry split into colour zones.
@@ -52,13 +52,16 @@ class MeshGenerator:
         Only the top SURFACE gets terrain colours — side walls and the bottom
         go into "base" so the model sides always match the base colour.
 
-        water: list of features from fetch_water_bodies():
-          lakes/seas as {"type", "coords"}, rivers as {"type":"river", "line"}.
+        water/forests: features from fetch_map_features().
+        Land/rock split: a cell is vegetated (land) when it lies below the
+        tree_line_m altitude OR inside a mapped OSM forest polygon — mapped
+        forests give real tree edges, the altitude rule fills unmapped areas.
         detect_ocean_m: if not None, cells with original elevation <= this value
-          (metres) are treated as sea/ocean.
+        (metres) are treated as sea/ocean.
 
         Leaves the generator set up, so route_tris() can be called afterwards.
-        The merged water mask stays available as self.last_water_mask.
+        Masks stay available as self.last_water_mask / self.last_rock_mask
+        (vertex lattice) for the thumbnail renderer.
         """
         self._setup(elevation_grid, lat_bounds, lon_bounds)
         water_mask, grid = self._build_water_features(
@@ -72,28 +75,27 @@ class MeshGenerator:
         self.sz = self.max_ele_mm / max(self.ele_max - self.ele_min, 1.0)
         self._refresh_interp(grid)
 
-        surface_tris, wall_tris = self._terrain(grid)
-
-        # Split the surface by colour zone (vectorised: centroid → cell/z)
-        tree_z = self.ele_to_z(tree_line_m)
         rows, cols = grid.shape
+        rock_mask = self._build_rock_mask(grid, forests, tree_line_m)
+        self.last_rock_mask = rock_mask
+
+        surface_tris, wall_tris = self._terrain(grid)
 
         tris = np.asarray(surface_tris, dtype=np.float64)
         if tris.size == 0:
             zones = {"land": [], "rock": [], "water": []}
         else:
+            # Classify by centroid cell. Floor (not round) so both triangles
+            # of a quad land in the same cell — otherwise thin features like
+            # rivers render dashed.
             cx = tris[:, :, 0].mean(axis=1)
             cy = tris[:, :, 1].mean(axis=1)
-            cz = tris[:, :, 2].mean(axis=1)
+            j = np.clip((cx / self.model_w * (cols - 1)).astype(int), 0, cols - 1)
+            i = np.clip(((1.0 - cy / self.model_h) * (rows - 1)).astype(int), 0, rows - 1)
 
-            if water_mask is not None:
-                j = np.clip(np.round(cx / self.model_w * (cols - 1)).astype(int), 0, cols - 1)
-                i = np.clip(np.round((1.0 - cy / self.model_h) * (rows - 1)).astype(int), 0, rows - 1)
-                in_water = water_mask[i, j]
-            else:
-                in_water = np.zeros(len(tris), dtype=bool)
-
-            is_rock = (cz >= tree_z) & ~in_water
+            in_water = water_mask[i, j] if water_mask is not None \
+                else np.zeros(len(tris), dtype=bool)
+            is_rock = rock_mask[i, j] & ~in_water
             is_land = ~in_water & ~is_rock
             zones = {
                 "land":  tris[is_land].tolist(),
@@ -105,11 +107,28 @@ class MeshGenerator:
         zones["base"] = wall_tris
         return zones
 
-    def route_tris(self, gpx_points, flat=False):
+    def _build_rock_mask(self, grid, forests, tree_line_m):
+        """
+        Vertex-lattice mask of non-vegetated ("rock") terrain: above the tree
+        line AND not inside a mapped forest. OSM forest polygons carve real
+        tree edges; the altitude rule covers areas OSM hasn't mapped.
+        """
+        rows, cols = grid.shape
+        rock = grid >= tree_line_m
+        if forests:
+            forest_mask = np.zeros((rows, cols), dtype=bool)
+            for f in forests:
+                forest_mask |= self._mask_from_feature(f, rows, cols)
+            rock &= ~forest_mask
+        return rock
+
+    def route_tris(self, gpx_points, flat=False, use_gpx_ele=False):
         """
         Trail ribbon triangles. Requires a prior generate_zone_tris()/_setup().
-        flat=True builds the ribbon at one constant height (median terrain z
-        along the path) — used for swims, which must not go up or down.
+        flat=True: ribbon at one constant height (median terrain z along the
+        path) — used for swims, which must not go up or down.
+        use_gpx_ele=True: ribbon height from the GPX file's own elevation
+        data instead of the map terrain.
         """
         if not gpx_points or len(gpx_points) < 2:
             return []
@@ -119,7 +138,8 @@ class MeshGenerator:
                   if self._in_bounds(p[0], p[1])]
             if zs:
                 flat_z = float(np.median(zs))
-        return self._route(gpx_points, flat_z=flat_z)
+        return self._route(gpx_points, flat_z=flat_z,
+                           use_gpx_ele=use_gpx_ele and flat_z is None)
 
     def to_stl_bytes(self, triangles):
         """Serialise a triangle list to binary STL."""
@@ -303,6 +323,15 @@ class MeshGenerator:
                 d.polygon(pts, fill=1)
         return np.array(img, dtype=bool)
 
+    def _mask_from_feature(self, feature, rows, cols):
+        """Mask of a polygon feature: outer ring minus its hole rings
+        (islands in lakes, clearings in forests)."""
+        mask = self._rasterize_ll_polys([feature["coords"]], rows, cols)
+        holes = feature.get("holes") or []
+        if mask.any() and holes:
+            mask &= ~self._rasterize_ll_polys(holes, rows, cols)
+        return mask
+
     def _rasterize_xy_line(self, pts_xy, rows, cols, width_px=1):
         """Rasterise a polyline in model-xy space → bool mask (every cell hit)."""
         img = Image.new("1", (cols, rows), 0)
@@ -396,28 +425,27 @@ class MeshGenerator:
         merged = np.zeros((rows, cols), dtype=bool)
         ele_min = float(np.nanmin(grid))
 
-        lakes, sea_polys, rivers = [], [], []
+        lakes, seas, rivers = [], [], []
         for w in water_features or []:
             if w["type"] == "river":
                 line = w.get("line") or []
                 if len(line) >= 2:
                     rivers.append(line)
-            elif w["type"] == "sea" and len(w.get("coords", [])) >= 3:
-                sea_polys.append(w["coords"])
-            elif w["type"] == "lake" and len(w.get("coords", [])) >= 3:
-                lakes.append(w["coords"])
+            elif len(w.get("coords", [])) >= 3:
+                (seas if w["type"] == "sea" else lakes).append(w)
 
-        # Lakes: each body flat at its own level
-        for coords in lakes:
-            mask = self._rasterize_ll_polys([coords], rows, cols)
+        # Lakes: each body flat at its own level; islands (hole rings)
+        # stay terrain.
+        for lake in lakes:
+            mask = self._mask_from_feature(lake, rows, cols)
             if mask.any():
                 out[mask] = float(np.median(grid[mask]))
                 merged |= mask
 
         # Seas: flatten to the map minimum
         sea_mask = np.zeros((rows, cols), dtype=bool)
-        if sea_polys:
-            sea_mask |= self._rasterize_ll_polys(sea_polys, rows, cols)
+        for sea in seas:
+            sea_mask |= self._mask_from_feature(sea, rows, cols)
         if detect_ocean_m is not None:
             sea_mask |= grid <= detect_ocean_m
         if sea_mask.any():
@@ -505,8 +533,11 @@ class MeshGenerator:
         partial = (n_in > 0) & (n_in < 4)
 
         # Only quads near the boundary need slow edge bookkeeping; strictly
-        # interior full quads can never contribute boundary edges.
-        near_boundary = binary_dilation(~full, iterations=2)
+        # interior full quads can never contribute boundary edges. The grid
+        # edge itself is a boundary too (square shapes fill the whole grid).
+        padded = np.ones((full.shape[0] + 2, full.shape[1] + 2), dtype=bool)
+        padded[1:-1, 1:-1] = ~full
+        near_boundary = binary_dilation(padded, iterations=2)[1:-1, 1:-1]
         fast_full = full & ~near_boundary
         slow_full = full & near_boundary
 
@@ -722,7 +753,7 @@ class MeshGenerator:
 
     # ── GPX route ribbon ─────────────────────────────────────────────────
 
-    def _route(self, points, flat_z=None):
+    def _route(self, points, flat_z=None, use_gpx_ele=False):
         hw     = self.route_width_mm / 2.0
         raise_ = self.route_height_mm
         MIN_D  = hw * 0.5   # minimum spacing to remove GPS jitter
@@ -741,13 +772,36 @@ class MeshGenerator:
         if len(pts2d) < 2:
             return []
 
+        def z_terrain(x, y):
+            lat, lon = self._xy_to_ll(x, y)
+            return self.z_at(lat, lon)
+
         if flat_z is not None:
-            def z_xy(x, y):
-                return flat_z
+            def z_top(x, y):
+                return flat_z + raise_
+
+            z_bottom = (lambda x, y: flat_z)
+        elif use_gpx_ele:
+            # Height from the GPX file's own elevation (nearest track point)
+            in_pts = [(self.ll_to_xy(p[0], p[1]), p[2]) for p in points
+                      if self._in_bounds(p[0], p[1])]
+            kd = cKDTree([xy for xy, _ in in_pts])
+            eles = np.array([e for _, e in in_pts])
+
+            def z_gpx(x, y):
+                return self.ele_to_z(float(eles[kd.query((x, y))[1]]))
+
+            def z_top(x, y):
+                return z_gpx(x, y) + raise_
+
+            def z_bottom(x, y):
+                # Anchor into the terrain where the GPX dips below it
+                return min(z_gpx(x, y), z_terrain(x, y))
         else:
-            def z_xy(x, y):
-                lat, lon = self._xy_to_ll(x, y)
-                return self.z_at(lat, lon)
+            def z_top(x, y):
+                return z_terrain(x, y) + raise_
+
+            z_bottom = z_terrain
 
         # Simplify before buffering to remove GPS-noise zigzags
         path = LineString(pts2d).simplify(hw * 0.8, preserve_topology=True)
@@ -759,7 +813,7 @@ class MeshGenerator:
         if ribbon.is_empty:
             return []
 
-        return self._prism_tris(ribbon, lambda x, y: z_xy(x, y) + raise_, z_xy)
+        return self._prism_tris(ribbon, z_top, z_bottom)
 
     # ── Binary STL serialisation (vectorised) ────────────────────────────
 

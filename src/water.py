@@ -1,21 +1,36 @@
+"""
+Map features from OpenStreetMap via Overpass: water bodies and forests.
+
+Polygon features carry optional hole rings — islands inside lakes and
+clearings inside forests — assembled from multipolygon inner ways.
+"""
+
+from shapely.geometry import Point, Polygon
+
 from src.overpass import index_elements, query_overpass, way_coords
 
 
-def fetch_water_bodies(lat_min, lat_max, lon_min, lon_max, max_features=2000):
+def fetch_map_features(lat_min, lat_max, lon_min, lon_max, max_features=2000):
     """
-    Fetch water bodies from OpenStreetMap via Overpass API.
+    Fetch water bodies and forest polygons in one Overpass query.
 
-    Returns list of dicts:
-      lakes/seas : {type: 'lake'|'sea', coords: [(lat, lon)...]}   (polygon ring)
-      rivers     : {type: 'river', line: [(lat, lon)...]}          (ordered way;
-                   OSM convention: points run downstream)
+    Returns (water, forests):
+      water   : lakes/seas as {"type": 'lake'|'sea', "coords": ring, "holes": [rings]}
+                rivers as {"type": 'river', "line": [(lat, lon)...]}
+                (ordered way; OSM convention: points run downstream)
+      forests : {"coords": ring, "holes": [rings]}
     """
+    bbox = f"({lat_min},{lon_min},{lat_max},{lon_max})"
     query = f"""
-    [out:json][timeout:60];
+    [out:json][timeout:90];
     (
-      way["natural"~"^(water|bay)$"]({lat_min},{lon_min},{lat_max},{lon_max});
-      way["waterway"~"^(river|stream|canal)$"]({lat_min},{lon_min},{lat_max},{lon_max});
-      relation["natural"~"^(water|bay)$"]({lat_min},{lon_min},{lat_max},{lon_max});
+      way["natural"~"^(water|bay)$"]{bbox};
+      way["waterway"~"^(river|stream|canal)$"]{bbox};
+      relation["natural"~"^(water|bay)$"]{bbox};
+      way["natural"="wood"]{bbox};
+      way["landuse"="forest"]{bbox};
+      relation["natural"="wood"]{bbox};
+      relation["landuse"="forest"]{bbox};
     );
     out body;
     >;
@@ -25,7 +40,7 @@ def fetch_water_bodies(lat_min, lat_max, lon_min, lon_max, max_features=2000):
     try:
         data = query_overpass(query)
     except Exception:
-        return []
+        return [], []
 
     nodes, ways, rels = index_elements(data)
 
@@ -39,50 +54,81 @@ def fetch_water_bodies(lat_min, lat_max, lon_min, lon_max, max_features=2000):
             return "lake"
         if waterway in ("river", "stream", "canal"):
             return "river"
+        if natural == "wood" or tags.get("landuse") == "forest":
+            return "forest"
         return None
 
-    features = []
+    water, forests = [], []
+
+    def _add(kind, coords, holes):
+        if len(coords) < 3:
+            return
+        feature = {"coords": coords, "holes": holes}
+        if kind == "forest":
+            forests.append(feature)
+        else:
+            feature["type"] = kind
+            water.append(feature)
 
     # Ways — the response also contains untagged member/skeleton ways from
     # the `>` recursion, so only classify the tagged ones.
     for way in ways.values():
-        w_type = _classify(way.get("tags") or {})
-        if not w_type:
+        kind = _classify(way.get("tags") or {})
+        if not kind:
             continue
         coords = way_coords(way, nodes)
-        if w_type == "river":
+        if kind == "river":
             # Rivers are linear ways, not rings — keep OSM point order
             if len(coords) >= 2:
-                features.append({"type": "river", "line": coords})
-        elif len(coords) >= 3:
-            features.append({"type": w_type, "coords": coords})
+                water.append({"type": "river", "line": coords})
+        else:
+            _add(kind, coords, [])
 
-    # Relations (multipolygons) – outer member ways are ring FRAGMENTS that
-    # must be stitched end-to-end into closed rings, otherwise each fragment
-    # would be treated as its own (wrongly shaped) water body.
+    # Relations (multipolygons) – member ways are ring FRAGMENTS that must be
+    # stitched end-to-end. "outer" rings are the body, "inner" rings are the
+    # holes (islands in lakes, clearings in forests).
     for rel in rels.values():
-        w_type = _classify(rel.get("tags") or {})
-        if not w_type or w_type == "river":
+        kind = _classify(rel.get("tags") or {})
+        if not kind or kind == "river":
             continue
-        segments = []
+        outer_segs, inner_segs = [], []
         for member in rel.get("members", []):
-            if member.get("type") != "way" or member.get("role") not in ("outer", ""):
+            if member.get("type") != "way":
                 continue
             way = ways.get(member.get("ref"))
-            if way and len(way.get("nodes", [])) >= 2:
-                segments.append(list(way["nodes"]))
-        for ring_refs in _assemble_rings(segments):
-            coords = [nodes[ref] for ref in ring_refs if ref in nodes]
-            if len(coords) >= 3:
-                features.append({"type": w_type, "coords": coords})
+            if not way or len(way.get("nodes", [])) < 2:
+                continue
+            role = member.get("role")
+            if role in ("outer", ""):
+                outer_segs.append(list(way["nodes"]))
+            elif role == "inner":
+                inner_segs.append(list(way["nodes"]))
+
+        inner_rings = [
+            [nodes[r] for r in ring if r in nodes]
+            for ring in _assemble_rings(inner_segs)
+        ]
+        for ring_refs in _assemble_rings(outer_segs):
+            coords = [nodes[r] for r in ring_refs if r in nodes]
+            if len(coords) < 3:
+                continue
+            try:
+                poly = Polygon(coords)
+                holes = [h for h in inner_rings
+                         if len(h) >= 3 and poly.contains(Point(h[0]))]
+            except Exception:
+                holes = []
+            _add(kind, coords, holes)
 
     # If over budget, keep the largest features (ring/line length as proxy)
-    if len(features) > max_features:
+    def _cap(features):
+        if len(features) <= max_features:
+            return features
         features.sort(
             key=lambda f: len(f.get("coords") or f.get("line") or ()), reverse=True)
-        features = features[:max_features]
+        return features[:max_features]
 
-    return features
+    return _cap(water), _cap(forests)
 
 
 def _assemble_rings(segments):

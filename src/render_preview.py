@@ -18,11 +18,12 @@ def _hex_to_rgb(h, fallback=(128, 128, 128)):
 
 
 def render_preview_png(grid, water_mask, lat_bounds, lon_bounds, trails,
-                       tree_line_m, colors, out_path, size=320):
+                       rock_mask, colors, out_path, size=320):
     """
     grid        : elevation ndarray (rows, cols), row 0 = lat_max
     water_mask  : boolean ndarray same shape, or None
     trails      : list of point lists [(lat, lon, ele), ...]
+    rock_mask   : boolean ndarray same shape (non-vegetated terrain), or None
     colors      : {"land","rock","water","track"} hex strings
     """
     rows, cols = grid.shape
@@ -37,7 +38,8 @@ def render_preview_png(grid, water_mask, lat_bounds, lon_bounds, trails,
 
     rgb = np.empty((rows, cols, 3), dtype=float)
     rgb[:] = land
-    rgb[grid >= tree_line_m] = rock
+    if rock_mask is not None:
+        rgb[rock_mask] = rock
     rgb *= shade[..., None]
     if water_mask is not None:
         rgb[water_mask] = water

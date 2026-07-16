@@ -42,7 +42,7 @@ from src.gpx_handler import get_gpx_bounds, is_swim, parse_gpx_with_type
 from src.mesh_generator import MeshGenerator
 from src.render_preview import render_preview_png
 from src.terrain import fetch_elevation_grid
-from src.water import fetch_water_bodies
+from src.water import fetch_map_features
 
 GENERATED_DIR = Path("generated")
 GPX_STORE     = GENERATED_DIR / "gpx"
@@ -154,8 +154,9 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
 
     lat_c, lon_c = _resolve_center(cfg, all_points, bounds)
 
+    # Border ring with text labels: hexagon models only (for now)
     labels = [str(x) for x in (cfg.get("borderLabels") or [])][:6]
-    has_labels = any(x.strip() for x in labels)
+    has_labels = cfg["shape"] == "hexagon" and any(x.strip() for x in labels)
     base_size = float(cfg["base_size"])
 
     height_scale = max(0.1, float(cfg["heightScale"]))
@@ -183,19 +184,19 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     progress("Downloading elevation data")
     grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
 
-    water_data = None
-    if cfg["includeSeas"] or cfg["includeLakes"] or cfg["includeRivers"]:
-        progress("Downloading water features")
-        try:
-            all_water = fetch_water_bodies(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-            water_data = [
-                w for w in all_water
-                if (w["type"] == "lake"  and cfg["includeLakes"])
-                or (w["type"] == "sea"   and cfg["includeSeas"])
-                or (w["type"] == "river" and cfg["includeRivers"])
-            ]
-        except Exception:
-            water_data = None
+    progress("Downloading map features (water, forests)")
+    water_data, forest_data = None, None
+    try:
+        all_water, forest_data = fetch_map_features(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
+        water_data = [
+            w for w in all_water
+            if (w["type"] == "lake"  and cfg["includeLakes"])
+            or (w["type"] == "sea"   and cfg["includeSeas"])
+            or (w["type"] == "river" and cfg["includeRivers"])
+        ]
+    except Exception:
+        import traceback
+        traceback.print_exc()   # degrade to a plain terrain model, but say why
 
     buildings_data = None
     if cfg["buildings"]:
@@ -213,10 +214,14 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
 
     zones = gen.generate_zone_tris(
         grid, lat_b, lon_b,
-        buildings=buildings_data, water=water_data,
+        buildings=buildings_data, water=water_data, forests=forest_data,
         tree_line_m=tree_line_m, detect_ocean_m=detect_ocean_m,
     )
-    trail_tris = [gen.route_tris(t["points"], flat=t["flat"]) for t in trails]
+    use_gpx_ele = bool(cfg["useHeightFromGpx"])
+    trail_tris = [
+        gen.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
+        for t in trails
+    ]
     border = gen.border_tris()        # border slab + raised text labels
     zones["base"] = zones["base"] + border["base"]   # walls/bottom + slab
     zones["text"] = border["text"]
@@ -242,7 +247,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     render_preview_png(
         grid, gen.last_water_mask, lat_b, lon_b,
         [t["points"] for t in trails],
-        tree_line_m,
+        gen.last_rock_mask,
         {
             "land":  cfg["landColor"],
             "rock":  cfg["rockColor"],
