@@ -543,16 +543,18 @@ class MeshGenerator:
             elif len(w.get("coords", [])) >= 3:
                 (seas if w["type"] == "sea" else lakes).append(w)
 
-        # Lakes: each body flat at its own SHORELINE level; islands (hole
-        # rings) stay terrain. The shoreline (mask boundary) is the right
-        # water level — elevation data inside a reservoir can show the dry
-        # basin floor from before it was filled, and using that would sink
-        # the water far below the surrounding land.
+        # Lakes: each body flat at the level of the LAND at its polygon edge,
+        # so the water always meets the shore without a wall. The DEM inside
+        # a lake polygon cannot be trusted: reservoirs may show the dry basin
+        # floor or a lower water stage than the mapped (full-pool) outline —
+        # only the terrain just outside the outline is reliable.
         for lake in lakes:
             mask = self._mask_from_feature(lake, rows, cols)
             if mask.any():
-                boundary = mask & ~binary_erosion(mask)
-                level_cells = boundary if boundary.any() else mask
+                rim = binary_dilation(mask) & ~mask
+                if not rim.any():
+                    rim = mask & ~binary_erosion(mask)
+                level_cells = rim if rim.any() else mask
                 out[mask] = float(np.median(grid[level_cells]))
                 merged |= mask
 
