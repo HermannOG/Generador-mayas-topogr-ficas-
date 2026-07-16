@@ -217,7 +217,9 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
         tree_line_m=tree_line_m, detect_ocean_m=detect_ocean_m,
     )
     trail_tris = [gen.route_tris(t["points"], flat=t["flat"]) for t in trails]
-    zones.update(gen.border_tris())   # "base" slab + raised "text" labels
+    border = gen.border_tris()        # border slab + raised text labels
+    zones["base"] = zones["base"] + border["base"]   # walls/bottom + slab
+    zones["text"] = border["text"]
 
     progress("Writing model files")
     job_dir.mkdir(parents=True, exist_ok=True)

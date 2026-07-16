@@ -48,7 +48,9 @@ class MeshGenerator:
         """
         Generate terrain geometry split into colour zones.
         Returns dict of triangle lists:
-          {"land": [...], "rock": [...], "water": [...], "buildings": [...]}
+          {"land", "rock", "water", "buildings", "base"}
+        Only the top SURFACE gets terrain colours — side walls and the bottom
+        go into "base" so the model sides always match the base colour.
 
         water: list of features from fetch_water_bodies():
           lakes/seas as {"type", "coords"}, rivers as {"type":"river", "line"}.
@@ -70,13 +72,13 @@ class MeshGenerator:
         self.sz = self.max_ele_mm / max(self.ele_max - self.ele_min, 1.0)
         self._refresh_interp(grid)
 
-        all_terrain = self._terrain(grid)
+        surface_tris, wall_tris = self._terrain(grid)
 
-        # Split by colour zone (vectorised: centroid → cell → mask/elevation)
+        # Split the surface by colour zone (vectorised: centroid → cell/z)
         tree_z = self.ele_to_z(tree_line_m)
         rows, cols = grid.shape
 
-        tris = np.asarray(all_terrain, dtype=np.float64)
+        tris = np.asarray(surface_tris, dtype=np.float64)
         if tris.size == 0:
             zones = {"land": [], "rock": [], "water": []}
         else:
@@ -100,6 +102,7 @@ class MeshGenerator:
             }
 
         zones["buildings"] = self._buildings(buildings) if buildings else []
+        zones["base"] = wall_tris
         return zones
 
     def route_tris(self, gpx_points, flat=False):
@@ -555,7 +558,8 @@ class MeshGenerator:
                         cz = (v1[0]-v0[0])*(v2[1]-v0[1]) - (v1[1]-v0[1])*(v2[0]-v0[0])
                         top_tris.append((v0, v1, v2) if cz >= 0 else (v0, v2, v1))
 
-        tris = fast_tris + list(top_tris)
+        surface = fast_tris + list(top_tris)
+        walls = []
         bot_pts = []
 
         # With a border, the terrain sits ON the base slab: walls stop at the
@@ -566,8 +570,8 @@ class MeshGenerator:
         for t1, t2 in self._boundary_edges(top_tris):
             b1 = [t1[0], t1[1], floor_z]
             b2 = [t2[0], t2[1], floor_z]
-            tris.append((t2, t1, b1))   # outward-facing (right of t1→t2)
-            tris.append((t2, b1, b2))
+            walls.append((t2, t1, b1))   # outward-facing (right of t1→t2)
+            walls.append((t2, b1, b2))
             bot_pts.append((t1[0], t1[1]))
             bot_pts.append((t2[0], t2[1]))
 
@@ -586,9 +590,9 @@ class MeshGenerator:
                 for k in range(n):
                     p0 = [uniq[k][0],         uniq[k][1],         0.0]
                     p1 = [uniq[(k+1) % n][0], uniq[(k+1) % n][1], 0.0]
-                    tris.append((cpt, p1, p0))  # -Z normal
+                    walls.append((cpt, p1, p0))  # -Z normal
 
-        return tris
+        return surface, walls
 
     # ── Border ring + text labels (hexagon) ──────────────────────────────
 
