@@ -60,7 +60,7 @@ DEFAULT_SETTINGS = {
     "trailHeight":           1,
     "useHeightFromGpx":      False,
     "shape":                 "hexagon",
-    "distanceTrackToBorder": 0.25,
+    "distanceTrackToBorder": 0,
     "baseThickness":         5,
     "includeSeas":           True,
     "includeLakes":          True,
@@ -157,17 +157,26 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
     labels = [str(x) for x in (cfg.get("borderLabels") or [])][:6]
     has_labels = any(x.strip() for x in labels)
     base_size = float(cfg["base_size"])
-    border_mm = max(6.0, 0.08 * base_size) if has_labels else 0.0
 
-    # Trail-to-border margin: never closer than 5% of the model per side;
-    # the "Distance Trail to Border" slider (0–1) adds up to +50% on top.
+    height_scale = max(0.1, float(cfg["heightScale"]))
+    gen = MeshGenerator({
+        "target_size_mm":     base_size,
+        "base_thickness_mm":  float(cfg["baseThickness"]),
+        "max_ele_height_mm":  20.0 * height_scale,
+        "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
+        "route_width_mm":     float(cfg["trailWidth"]),
+        "route_height_mm":    float(cfg["trailHeight"]),
+        "shape":              cfg["shape"],
+        "border_mm":          max(6.0, 0.08 * base_size) if has_labels else 0.0,
+        "border_labels":      labels,
+    })
+
+    # Zoom out until the whole route fits INSIDE the model shape (hexagon
+    # corners cut into the bounding box) with 5% clearance by default;
+    # the "Distance Trail to Border" slider (0–1) adds up to +50% more.
     knob = min(1.0, max(0.0, float(cfg["distanceTrackToBorder"])))
-    margin = 0.05 + 0.5 * knob
-    size_km = bounds["span_km"] * (1.0 + 2.0 * margin)
-    if border_mm:
-        # The border ring shrinks the terrain shape — zoom out to compensate
-        r_mm = 0.49 * base_size
-        size_km *= r_mm / max(r_mm - border_mm, 1e-6)
+    margin_frac = 0.05 + 0.5 * knob
+    size_km = gen.fit_size_km(all_points, lat_c, lon_c, bounds["span_km"], margin_frac)
 
     resolution = 300 if cfg["higherResolution"] else 200
 
@@ -197,18 +206,6 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress):
             buildings_data = None
 
     progress("Generating 3D mesh")
-    height_scale = max(0.1, float(cfg["heightScale"]))
-    gen = MeshGenerator({
-        "target_size_mm":     base_size,
-        "base_thickness_mm":  float(cfg["baseThickness"]),
-        "max_ele_height_mm":  20.0 * height_scale,
-        "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
-        "route_width_mm":     float(cfg["trailWidth"]),
-        "route_height_mm":    float(cfg["trailHeight"]),
-        "shape":              cfg["shape"],
-        "border_mm":          border_mm,
-        "border_labels":      labels,
-    })
 
     # For open seas/bays, SRTM returns ~0 m — use elevation threshold
     detect_ocean_m = 0.5 if cfg["includeSeas"] else None

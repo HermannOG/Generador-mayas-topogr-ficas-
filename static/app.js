@@ -24,7 +24,7 @@ const DEFAULT_SETTINGS = {
   trailHeight: 1,
   useHeightFromGpx: false,
   shape: "hexagon",
-  distanceTrackToBorder: 0.25,
+  distanceTrackToBorder: 0,   // extra margin beyond the built-in 5% minimum
   baseThickness: 5,
   includeSeas: true,
   includeLakes: true,

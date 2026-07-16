@@ -144,8 +144,8 @@ class MeshGenerator:
 
     # ── Coordinate setup ─────────────────────────────────────────────────
 
-    def _setup(self, grid, lat_bounds, lon_bounds):
-        rows, cols = grid.shape
+    def _frame(self, lat_bounds, lon_bounds):
+        """Set the lat/lon → model-mm mapping and the model shape polygons."""
         lat_min, lat_max = lat_bounds
         lon_min, lon_max = lon_bounds
         lat_mid = (lat_min + lat_max) / 2.0
@@ -158,16 +158,8 @@ class MeshGenerator:
         self.model_w = width_m  * self.sxy
         self.model_h = height_m * self.sxy
 
-        self.ele_min = float(np.nanmin(grid))
-        self.ele_max = float(np.nanmax(grid))
-        ele_range    = max(self.ele_max - self.ele_min, 1.0)
-        self.sz      = self.max_ele_mm / ele_range
-
         self.lat_min, self.lat_max = lat_min, lat_max
         self.lon_min, self.lon_max = lon_min, lon_max
-        self.rows, self.cols = rows, cols
-
-        self._refresh_interp(grid)
 
         cx, cy = self.model_w / 2, self.model_h / 2
         r = min(cx, cy) * 0.98
@@ -177,6 +169,49 @@ class MeshGenerator:
         else:
             self._outer_poly = None
             self._shape_poly = self._make_shape(cx, cy, r)
+
+    def _setup(self, grid, lat_bounds, lon_bounds):
+        self._frame(lat_bounds, lon_bounds)
+
+        self.ele_min = float(np.nanmin(grid))
+        self.ele_max = float(np.nanmax(grid))
+        ele_range    = max(self.ele_max - self.ele_min, 1.0)
+        self.sz      = self.max_ele_mm / ele_range
+
+        self.rows, self.cols = grid.shape
+        self._refresh_interp(grid)
+
+    # ── Area fitting ─────────────────────────────────────────────────────
+
+    def fit_size_km(self, points, lat_c, lon_c, span_km, margin_frac):
+        """
+        Smallest map area (km) centred on (lat_c, lon_c) whose model SHAPE
+        (hexagon/octagon/circle/square, minus any border ring) contains every
+        route point with margin_frac × model-size clearance from the edge.
+        A square bounding box isn't enough — shape corners cut into it.
+        """
+        pts = [(p[0], p[1]) for p in points[::max(1, len(points) // 500)]]
+        size = max(span_km, 0.2)
+        for _ in range(60):
+            if self._points_fit(pts, lat_c, lon_c, size, margin_frac):
+                break
+            size *= 1.05
+        return size
+
+    def _points_fit(self, pts, lat_c, lon_c, size_km, margin_frac):
+        lat_d = (size_km / 2.0) / 111.0
+        lon_d = (size_km / 2.0) / (111.0 * math.cos(math.radians(lat_c)))
+        self._frame((lat_c - lat_d, lat_c + lat_d), (lon_c - lon_d, lon_c + lon_d))
+
+        shrunk = self._shape_poly.buffer(-margin_frac * self.target_size_mm)
+        if shrunk.is_empty:
+            return False
+        for lat, lon in pts:
+            if not self._in_bounds(lat, lon):
+                return False
+            if not shrunk.contains(Point(*self.ll_to_xy(lat, lon))):
+                return False
+        return True
 
     def _refresh_interp(self, grid):
         lat_arr = np.linspace(self.lat_max, self.lat_min, grid.shape[0])
