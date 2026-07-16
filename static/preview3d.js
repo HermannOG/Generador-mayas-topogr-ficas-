@@ -9,6 +9,11 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { OBJLoader }     from "three/addons/loaders/OBJLoader.js";
+import { mergeVertices } from "three/addons/utils/BufferGeometryUtils.js";
+
+// Terrain zones get welded vertices + smooth normals; base/text keep
+// crisp flat shading (walls and letters should stay sharp)
+const SMOOTH_ZONES = new Set(["sand", "forest", "rock", "snow", "water", "trail"]);
 
 let renderer, scene, camera, controls;
 let animId = null;
@@ -69,11 +74,16 @@ function makeMaterial(colorHex) {
   });
 }
 
-function applyColors(objRoot, colorByName, fallback) {
+function applyColors(objRoot, colorByName, fallback, smoothFallback = false) {
   objRoot.traverse(obj => {
     if (!obj.isMesh) return;
     const colorHex = colorByName[obj.name] ?? fallback;
     obj.material = makeMaterial(colorHex);
+    if (SMOOTH_ZONES.has(obj.name) || smoothFallback) {
+      // OBJ triangles are a soup: weld shared vertices so normals average
+      // across faces — otherwise the terrain renders faceted/blocky
+      obj.geometry = mergeVertices(obj.geometry, 1e-4);
+    }
     obj.geometry.computeVertexNormals();
     obj.castShadow    = true;
     obj.receiveShadow = true;

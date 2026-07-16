@@ -19,7 +19,7 @@ from scipy.ndimage import gaussian_filter
 TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 TILE_CACHE_DIR = Path("generated") / "tiles"
 TILE_SIZE = 256
-MAX_ZOOM = 14
+MAX_ZOOM = 15
 MIN_ZOOM = 8
 
 
