@@ -17,7 +17,9 @@ from scipy.ndimage import (binary_dilation, binary_erosion,
                            distance_transform_edt, gaussian_filter)
 from scipy.spatial import cKDTree
 import mapbox_earcut as earcut
+from contourpy import contour_generator
 from shapely.geometry import LineString, Point, Polygon
+from shapely.strtree import STRtree
 
 MAX_RELIEF_MM = 40.0     # safety cap on terrain relief above the base
 
@@ -32,6 +34,8 @@ class MeshGenerator:
         self.height_scale    = cfg.get("height_scale",        1.0)
         # Smallest printable feature (rivers narrower than this are dropped)
         self.min_feature_mm  = cfg.get("min_feature_mm",      0.4)
+        # Cut zone boundaries along smooth vector curves instead of cells
+        self.smooth_zones    = cfg.get("smooth_zones",       True)
         self.building_h_mm   = cfg.get("building_height_mm",  2.0)
         self.route_width_mm  = cfg.get("route_width_mm",      1.0)
         self.route_height_mm = cfg.get("route_height_mm",     1.0)
@@ -106,26 +110,35 @@ class MeshGenerator:
                                         forest_level, snow_level)
         self.last_zone_map = zone_map
 
-        surface_tris, crust_tris, body_tris, bottom_tris = self._terrain(grid)
+        surfaces, crust_tris, body_tris, bottom_tris = self._terrain(
+            grid, zone_map if self.smooth_zones else None)
 
         zones = {name: [] for name in self.ZONES}
-        # Surface and crust walls take the zone colour of their cell; the
-        # wall body below the crust is always rock.
-        for tri_list in (surface_tris, crust_tris):
+
+        def classify_by_cell(tri_list, into):
+            """Fallback per-cell classification (smooth mode off / crust)."""
             tris = np.asarray(tri_list, dtype=np.float64)
             if not tris.size:
-                continue
-            # Classify by centroid cell. Floor (not round) so both triangles
-            # of a quad land in the same cell — otherwise thin features like
-            # rivers render dashed.
+                return
             cx = tris[:, :, 0].mean(axis=1)
             cy = tris[:, :, 1].mean(axis=1)
             j = np.clip((cx / self.model_w * (cols - 1)).astype(int), 0, cols - 1)
             i = np.clip(((1.0 - cy / self.model_h) * (rows - 1)).astype(int), 0, rows - 1)
             tri_zone = zone_map[i, j]
             for zid, name in enumerate(self.ZONES):
-                zones[name].extend(tris[tri_zone == zid].tolist())
+                into[name].extend(tris[tri_zone == zid].tolist())
 
+        # Surfaces: smooth mode delivers them already cut per zone along
+        # smooth vector boundaries; otherwise classify per cell.
+        for zid, tri_list in surfaces.items():
+            if zid is None:
+                classify_by_cell(tri_list, zones)
+            else:
+                zones[self.ZONES[zid]].extend(tri_list)
+
+        # Crust walls take the surface colour of their cell; the wall body
+        # below the crust is always rock.
+        classify_by_cell(crust_tris, zones)
         zones["rock"].extend(body_tris)
         zones["buildings"] = self._buildings(buildings) if buildings else []
         zones["base"] = bottom_tris
@@ -698,36 +711,37 @@ class MeshGenerator:
 
     # ── Terrain solid ─────────────────────────────────────────────────────
 
-    def _terrain(self, elevation_grid):
-        rows, cols = elevation_grid.shape
-
-        # Vertex lattice (vectorised)
+    def _lattice(self, grid):
+        """Vertex lattice: model xy + z for every grid node."""
+        rows, cols = grid.shape
         xs = np.linspace(0.0, self.model_w, cols)
         ys = np.linspace(self.model_h, 0.0, rows)   # row 0 = north = max y
         X, Y = np.meshgrid(xs, ys)
-        Z = self.ele_to_z(elevation_grid)
-        V = np.stack([X, Y, Z], axis=-1)
+        return np.stack([X, Y, self.ele_to_z(grid)], axis=-1)
 
-        # Quad classification against the model shape. Rasterisation alone is
-        # half-a-cell sloppy and produced sawtooth edges — use a STRICT mask
-        # (shape shrunk by a cell) for guaranteed-inside full quads and a
-        # LOOSE mask (shape grown by a cell) to find candidates for exact
-        # shapely clipping, so the cut lands precisely on the shape outline.
+    def _region_surface(self, V, poly):
+        """
+        Surface triangles clipped EXACTLY to a region polygon. Rasterisation
+        alone is half-a-cell sloppy — a STRICT mask (region shrunk by a cell)
+        marks guaranteed-inside quads, a LOOSE mask (region grown) marks
+        candidates for exact shapely clipping, so cuts land precisely on the
+        region outline (model shape or a smooth zone boundary).
+        Returns (fast_tris, slow_tris): slow tris are near a boundary and
+        must take part in wall/edge accounting; fast tris never can.
+        """
+        rows, cols = V.shape[:2]
         cell_mm = self.model_w / max(cols - 1, 1)
-        inside_strict = self._rasterize_xy_poly(
-            self._shape_poly.buffer(-1.6 * cell_mm), rows, cols)
-        inside_loose = self._rasterize_xy_poly(
-            self._shape_poly.buffer(+1.6 * cell_mm), rows, cols)
+        strict = self._rasterize_xy_poly(poly.buffer(-1.6 * cell_mm), rows, cols)
+        loose = self._rasterize_xy_poly(poly.buffer(+1.6 * cell_mm), rows, cols)
 
-        n_strict = (inside_strict[:-1, :-1].astype(np.int8) + inside_strict[:-1, 1:] +
-                    inside_strict[1:, 1:] + inside_strict[1:, :-1])
-        n_loose = (inside_loose[:-1, :-1].astype(np.int8) + inside_loose[:-1, 1:] +
-                   inside_loose[1:, 1:] + inside_loose[1:, :-1])
+        n_strict = (strict[:-1, :-1].astype(np.int8) + strict[:-1, 1:] +
+                    strict[1:, 1:] + strict[1:, :-1])
+        n_loose = (loose[:-1, :-1].astype(np.int8) + loose[:-1, 1:] +
+                   loose[1:, 1:] + loose[1:, :-1])
         full    = n_strict == 4
         partial = ~full & (n_loose > 0)
 
-        # Only quads near the boundary need slow edge bookkeeping; strictly
-        # interior full quads can never contribute boundary edges. The grid
+        # Only quads near a boundary need slow edge bookkeeping; the grid
         # edge itself is a boundary too (square shapes fill the whole grid).
         padded = np.ones((full.shape[0] + 2, full.shape[1] + 2), dtype=bool)
         padded[1:-1, 1:-1] = ~full
@@ -736,7 +750,6 @@ class MeshGenerator:
         slow_full = full & near_boundary
 
         # Fast path: bulk-emit interior full quads
-        top_tris = []
         fi, fj = np.nonzero(fast_full)
         if len(fi):
             v00 = V[fi, fj]; v01 = V[fi, fj + 1]
@@ -749,22 +762,27 @@ class MeshGenerator:
         else:
             fast_tris = []
 
-        # Slow path: boundary-zone quads (full near boundary + clipped partial)
+        # Spatial index over the region's parts keeps per-quad clipping cheap
+        parts = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
+        tree = STRtree(parts)
+
+        slow_tris = []
         si, sj = np.nonzero(slow_full | partial)
         for i, j in zip(si.tolist(), sj.tolist()):
             if slow_full[i, j]:
                 v00 = V[i,   j  ].tolist(); v01 = V[i,   j+1].tolist()
                 v10 = V[i+1, j  ].tolist(); v11 = V[i+1, j+1].tolist()
-                top_tris.append((v00, v11, v01))
-                top_tris.append((v00, v10, v11))
-            else:
-                quad_poly = Polygon([
-                    (V[i,j][0],     V[i,j][1]),
-                    (V[i,j+1][0],   V[i,j+1][1]),
-                    (V[i+1,j+1][0], V[i+1,j+1][1]),
-                    (V[i+1,j][0],   V[i+1,j][1]),
-                ])
-                clipped = self._shape_poly.intersection(quad_poly)
+                slow_tris.append((v00, v11, v01))
+                slow_tris.append((v00, v10, v11))
+                continue
+            quad_poly = Polygon([
+                (V[i,j][0],     V[i,j][1]),
+                (V[i,j+1][0],   V[i,j+1][1]),
+                (V[i+1,j+1][0], V[i+1,j+1][1]),
+                (V[i+1,j][0],   V[i+1,j][1]),
+            ])
+            for pi in tree.query(quad_poly):
+                clipped = parts[pi].intersection(quad_poly)
                 if clipped.is_empty:
                     continue
                 geoms = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
@@ -781,9 +799,89 @@ class MeshGenerator:
                     for k in range(1, len(verts) - 1):
                         v0, v1, v2 = verts[0], verts[k], verts[k+1]
                         cz = (v1[0]-v0[0])*(v2[1]-v0[1]) - (v1[1]-v0[1])*(v2[0]-v0[0])
-                        top_tris.append((v0, v1, v2) if cz >= 0 else (v0, v2, v1))
+                        slow_tris.append((v0, v1, v2) if cz >= 0 else (v0, v2, v1))
 
-        surface = fast_tris + list(top_tris)
+        return fast_tris, slow_tris
+
+    def _smooth_field_polys(self, mask, rows, cols):
+        """
+        Vector outline of a raster mask as SMOOTH polygons in model xy.
+        The mask is softened, contour-traced at sub-cell precision, and the
+        marching-squares corners are rounded off — procedural smooth lines
+        instead of pixel staircases.
+        """
+        if not mask.any():
+            return None
+        field = gaussian_filter(mask.astype(np.float32), 1.0)
+        padded = np.pad(field, 1, constant_values=0.0)
+        cell = self.model_w / max(cols - 1, 1)
+
+        geom = None
+        for arr in contour_generator(z=padded).lines(0.45):
+            if len(arr) < 4:
+                continue
+            xs = (arr[:, 0] - 1) / (cols - 1) * self.model_w
+            ys = (1.0 - (arr[:, 1] - 1) / (rows - 1)) * self.model_h
+            p = Polygon(np.column_stack([xs, ys]))
+            if not p.is_valid:
+                p = p.buffer(0)
+            if p.is_empty:
+                continue
+            geom = p if geom is None else geom.symmetric_difference(p)
+        if geom is None or geom.is_empty:
+            return None
+        r = 1.0 * cell
+        geom = (geom.buffer(r, join_style=1).buffer(-r, join_style=1)
+                .simplify(0.2 * cell))
+        return None if geom.is_empty else geom
+
+    def _zone_regions(self, zone_map):
+        """
+        Partition the model shape into smooth vector regions per zone,
+        precedence water > snow > forest, remainder = rock.
+        """
+        rows, cols = zone_map.shape
+        regions = []
+        occupied = None
+        for zid in (self.Z_WATER, self.Z_SNOW, self.Z_FOREST):
+            g = self._smooth_field_polys(zone_map == zid, rows, cols)
+            if g is None:
+                continue
+            g = g.intersection(self._shape_poly)
+            if occupied is not None:
+                g = g.difference(occupied)
+            if g.is_empty:
+                continue
+            regions.append((zid, g))
+            occupied = g if occupied is None else occupied.union(g)
+        rock = (self._shape_poly.difference(occupied)
+                if occupied is not None else self._shape_poly)
+        if not rock.is_empty:
+            regions.append((self.Z_ROCK, rock))
+        return regions
+
+    def _terrain(self, elevation_grid, zone_map=None):
+        """
+        Build the terrain surface(s) plus cut walls and bottom.
+        zone_map given (smooth mode): the surface is cut along smooth vector
+        zone boundaries and returned per zone id. zone_map None: one surface
+        under key None, classified per cell by the caller.
+        Returns (surfaces: dict, crust, body, bottom).
+        """
+        V = self._lattice(elevation_grid)
+
+        if zone_map is not None:
+            region_list = self._zone_regions(zone_map)
+        else:
+            region_list = [(None, self._shape_poly)]
+
+        surfaces = {}
+        all_slow = []
+        for zid, poly in region_list:
+            fast, slow = self._region_surface(V, poly)
+            surfaces[zid] = surfaces.get(zid, []) + fast + slow
+            all_slow += slow
+
         crust, body = [], []
         bot_pts = []
 
@@ -795,7 +893,7 @@ class MeshGenerator:
         # zone colour (cutting through snow shows a white line, through a
         # lake a blue line), and the BODY below reads as rock — like a
         # geological cross-section.
-        for t1, t2 in self._boundary_edges(top_tris):
+        for t1, t2 in self._boundary_edges(all_slow):
             c1 = [t1[0], t1[1], max(t1[2] - self.CRUST_MM, floor_z)]
             c2 = [t2[0], t2[1], max(t2[2] - self.CRUST_MM, floor_z)]
             crust.append((t2, t1, c1))   # outward-facing (right of t1→t2)
@@ -826,7 +924,7 @@ class MeshGenerator:
                     p1 = [uniq[(k+1) % n][0], uniq[(k+1) % n][1], 0.0]
                     bottom.append((cpt, p1, p0))  # -Z normal
 
-        return surface, crust, body, bottom
+        return surfaces, crust, body, bottom
 
     # ── Border ring + text labels (hexagon) ──────────────────────────────
 

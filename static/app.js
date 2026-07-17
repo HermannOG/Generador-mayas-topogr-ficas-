@@ -38,6 +38,7 @@ const DEFAULT_SETTINGS = {
   buildings: false,
   building_scale: 1,
   buildingsColor: "#777777",
+  smooth: true,            // smooth vector zone boundaries (no pixel blocks)
   printResolution: 0.2,   // mm per mesh cell: 0.1 / 0.2 / 0.4 / 0.8
   singleColor: false,
   singleColor_gap: 0.5,
@@ -51,7 +52,7 @@ const DEFAULT_SETTINGS = {
 // Panel inputs whose element id === settings key
 const COLOR_KEYS = ["waterColor", "landColor", "rockColor", "snowColor",
                     "trackColor", "buildingsColor", "baseColor", "textColor"];
-const CHECKBOX_KEYS = ["useHeightFromGpx", "includeSeas",
+const CHECKBOX_KEYS = ["useHeightFromGpx", "smooth", "includeSeas",
                        "includeLakes", "includeRivers", "buildings"];
 
 // Settings the site parses as numbers on change

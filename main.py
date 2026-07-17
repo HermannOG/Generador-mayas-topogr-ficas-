@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "building_scale":        1,
     "buildingsColor":        "#777777",
     "printResolution":       0.2,   # mm per mesh cell: 0.1 / 0.2 / 0.4 / 0.8
+    "smooth":                True,  # cut zone boundaries along smooth curves
     "singleColor":           False,
     "singleColor_gap":       0.5,
     # TopoTrail extensions (not on topotrail.com): hexagon border with text
@@ -176,6 +177,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
         "base_thickness_mm":  float(cfg["baseThickness"]),
         "height_scale":       max(0.0, float(cfg["heightScale"])),
         "min_feature_mm":     2.0 * cell_mm,
+        "smooth_zones":       bool(cfg["smooth"]),
         "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
         "route_width_mm":     float(cfg["trailWidth"]),
         "route_height_mm":    float(cfg["trailHeight"]),
