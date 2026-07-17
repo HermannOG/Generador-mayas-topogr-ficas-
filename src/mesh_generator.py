@@ -32,6 +32,8 @@ class MeshGenerator:
         self.base_mm         = cfg.get("base_thickness_mm",  15.0)
         # Vertical scale: 1.0 = true scale (same mm-per-metre as horizontal)
         self.height_scale    = cfg.get("height_scale",        1.0)
+        # Lock total model height (base bottom → highest peak) to 45 mm
+        self.standardize_45  = cfg.get("standardize_height", False)
         # Smallest printable feature (rivers narrower than this are dropped)
         self.min_feature_mm  = cfg.get("min_feature_mm",      0.4)
         # Cut zone boundaries along smooth vector curves instead of cells
@@ -309,26 +311,6 @@ class MeshGenerator:
         """Serialise a triangle list to binary STL."""
         return self._to_stl(triangles)
 
-    @staticmethod
-    def to_obj_bytes(groups):
-        """
-        Serialise named triangle groups to Wavefront OBJ (one `o` object per
-        group, so viewers can colour zones independently).
-        groups: dict name -> list of triangles.
-        """
-        lines = []
-        idx = 1
-        for name, tris in groups.items():
-            if not len(tris):
-                continue
-            lines.append(f"o {name}")
-            for tri in tris:
-                for v in tri:
-                    lines.append(f"v {v[0]:.3f} {v[1]:.3f} {v[2]:.3f}")
-                lines.append(f"f {idx} {idx + 1} {idx + 2}")
-                idx += 3
-        return ("\n".join(lines) + "\n").encode("ascii")
-
     # ── Coordinate setup ─────────────────────────────────────────────────
 
     def _frame(self, lat_bounds, lon_bounds):
@@ -364,8 +346,10 @@ class MeshGenerator:
         TRUE scale (identical to the horizontal scale); the relief is capped
         at MAX_RELIEF_MM so extreme scales stay printable.
         """
-        sz = self.sxy * max(0.0, float(self.height_scale))
         rng = max(float(ele_range_m), 1.0)
+        if self.standardize_45:
+            return max(45.0 - self.base_mm, 1.0) / rng
+        sz = self.sxy * max(0.0, float(self.height_scale))
         return min(sz, MAX_RELIEF_MM / rng)
 
     def _setup(self, grid, lat_bounds, lon_bounds):
@@ -485,19 +469,32 @@ class MeshGenerator:
         return np.array(img, dtype=bool)
 
     def _rasterize_xy_poly(self, poly, rows, cols):
-        """Rasterise a shapely polygon in model-xy space → bool mask."""
+        """
+        Rasterise a shapely (multi)polygon in model-xy space → bool mask,
+        RESPECTING interior holes (e.g. a snow patch inside a forest region).
+        Parts are drawn largest-first so islands inside another part's hole
+        are re-filled after the hole is punched.
+        """
         img = Image.new("1", (cols, rows), 0)
         d = ImageDraw.Draw(img)
-        geoms = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
-        for g in geoms:
-            if g.is_empty or g.geom_type != "Polygon":
-                continue
-            pts = [
+
+        def to_px(ring):
+            return [
                 (x / self.model_w * (cols - 1), (1.0 - y / self.model_h) * (rows - 1))
-                for x, y in g.exterior.coords
+                for x, y in ring.coords
             ]
+
+        geoms = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
+        geoms = [g for g in geoms if not g.is_empty and g.geom_type == "Polygon"]
+        geoms.sort(key=lambda g: g.area, reverse=True)
+        for g in geoms:
+            pts = to_px(g.exterior)
             if len(pts) >= 3:
                 d.polygon(pts, fill=1)
+            for hole in g.interiors:
+                hpts = to_px(hole)
+                if len(hpts) >= 3:
+                    d.polygon(hpts, fill=0)
         return np.array(img, dtype=bool)
 
     def _mask_from_feature(self, feature, rows, cols):
@@ -719,7 +716,7 @@ class MeshGenerator:
         X, Y = np.meshgrid(xs, ys)
         return np.stack([X, Y, self.ele_to_z(grid)], axis=-1)
 
-    def _region_surface(self, V, poly):
+    def _region_surface(self, V, poly, claimed=None):
         """
         Surface triangles clipped EXACTLY to a region polygon. Rasterisation
         alone is half-a-cell sloppy — a STRICT mask (region shrunk by a cell)
@@ -739,6 +736,11 @@ class MeshGenerator:
         n_loose = (loose[:-1, :-1].astype(np.int8) + loose[:-1, 1:] +
                    loose[1:, 1:] + loose[1:, :-1])
         full    = n_strict == 4
+        if claimed is not None:
+            # Raster masks are half-a-pixel sloppy: never let two regions
+            # both claim the same full quad (z-fighting checkerboards)
+            full &= ~claimed
+            claimed |= full
         partial = ~full & (n_loose > 0)
 
         # Only quads near a boundary need slow edge bookkeeping; the grid
@@ -787,7 +789,8 @@ class MeshGenerator:
                     continue
                 geoms = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
                 for geom in geoms:
-                    if geom.geom_type != "Polygon" or geom.is_empty:
+                    if (geom.geom_type != "Polygon" or geom.is_empty
+                            or geom.area < 1e-4):   # skip hairline seam slivers
                         continue
                     pts2d = list(geom.exterior.coords[:-1])
                     if len(pts2d) < 3:
@@ -877,8 +880,9 @@ class MeshGenerator:
 
         surfaces = {}
         all_slow = []
+        claimed = np.zeros((V.shape[0] - 1, V.shape[1] - 1), dtype=bool)
         for zid, poly in region_list:
-            fast, slow = self._region_surface(V, poly)
+            fast, slow = self._region_surface(V, poly, claimed)
             surfaces[zid] = surfaces.get(zid, []) + fast + slow
             all_slow += slow
 
@@ -1004,11 +1008,15 @@ class MeshGenerator:
     @staticmethod
     def _text_polygons(text, size_mm):
         """Text → shapely geometry (even-odd fill handles letter holes)."""
+        from pathlib import Path as _P
+
         from matplotlib.font_manager import FontProperties
         from matplotlib.textpath import TextPath
 
-        tp = TextPath((0, 0), text, size=size_mm,
-                      prop=FontProperties(family="DejaVu Sans", weight="bold"))
+        osifont = _P("assets/fonts/osifont.ttf")
+        prop = (FontProperties(fname=str(osifont)) if osifont.exists()
+                else FontProperties(family="DejaVu Sans", weight="bold"))
+        tp = TextPath((0, 0), text, size=size_mm, prop=prop)
         result = None
         for arr in tp.to_polygons():
             if len(arr) < 3:
@@ -1120,10 +1128,10 @@ class MeshGenerator:
         ribbon = path.buffer(hw, cap_style=2, join_style=1, resolution=8)
 
         # Out-and-back passes that don't retrace exactly leave a lumpy double
-        # line; morphological closing merges passes within ~1.5 trail-widths
-        # into one clean ribbon.
-        m = hw * 0.75
-        ribbon = ribbon.buffer(m).buffer(-m)
+        # line; morphological closing merges any touching/nearby passes into
+        # one clean combined ribbon, then the outline is relaxed.
+        m = hw * 1.5
+        ribbon = ribbon.buffer(m).buffer(-m).simplify(hw * 0.2)
 
         ribbon = ribbon.intersection(self._shape_poly)
         if ribbon.is_empty:

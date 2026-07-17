@@ -1,25 +1,25 @@
 /**
- * preview3d.js – inline 3D viewer for the main pane (mirrors the
- * topotrail.com viewer, which shows the generated model directly in the
- * top-left area). Loads the OBJ assets produced by /api/upload:
- * terrain.obj (one object per colour zone) + trail{i}.obj per GPX file.
+ * preview3d.js – inline 3D viewer for the main pane.
+ * Loads one binary STL per colour zone (zone_<name>.stl) plus trail{i}.stl,
+ * all produced by /api/upload. Terrain zones get welded vertices and smooth
+ * normals; the base slab and text keep crisp flat shading.
  * Exposes: window.Preview3D = { renderJob, clear }
  */
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { OBJLoader }     from "three/addons/loaders/OBJLoader.js";
+import { STLLoader }     from "three/addons/loaders/STLLoader.js";
 import { mergeVertices } from "three/addons/utils/BufferGeometryUtils.js";
 
-// Terrain zones get welded vertices + smooth normals; base/text keep
-// crisp flat shading (walls and letters should stay sharp)
-const SMOOTH_ZONES = new Set(["forest", "rock", "snow", "water", "trail"]);
+// Zones drawn back-to-front conceptually; missing files are skipped
+const ZONE_NAMES = ["base", "rock", "forest", "water", "snow", "buildings", "text"];
+const SMOOTH_ZONES = new Set(["rock", "forest", "water", "snow", "trail"]);
 
 let renderer, scene, camera, controls;
 let animId = null;
 let geoGroup = null;
 
-const loader = new OBJLoader();
+const stlLoader = new STLLoader();
 
 function initScene() {
   const canvas = document.getElementById("viewerCanvas");
@@ -74,56 +74,49 @@ function makeMaterial(colorHex) {
   });
 }
 
-function applyColors(objRoot, colorByName, fallback, smoothFallback = false) {
-  objRoot.traverse(obj => {
-    if (!obj.isMesh) return;
-    const colorHex = colorByName[obj.name] ?? fallback;
-    obj.material = makeMaterial(colorHex);
-    if (SMOOTH_ZONES.has(obj.name) || smoothFallback) {
-      // OBJ triangles are a soup: weld shared vertices so normals average
-      // across faces — otherwise the terrain renders faceted/blocky
-      obj.geometry = mergeVertices(obj.geometry, 1e-4);
-    }
-    obj.geometry.computeVertexNormals();
-    obj.castShadow    = true;
-    obj.receiveShadow = true;
-  });
+async function loadZone(url, colorHex, smooth) {
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
+  let geometry = stlLoader.parse(await resp.arrayBuffer());
+  if (smooth) {
+    // STL is a triangle soup: weld shared vertices so normals average
+    // across faces — otherwise the terrain renders faceted/blocky
+    geometry = mergeVertices(geometry, 1e-4);
+  }
+  geometry.computeVertexNormals();
+  const mesh = new THREE.Mesh(geometry, makeMaterial(colorHex));
+  mesh.castShadow    = true;
+  mesh.receiveShadow = true;
+  return mesh;
 }
 
 async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
   if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
 
-  const forestColor    = settings.landColor      ?? "#327B4B";
-  const rockColor      = settings.rockColor      ?? "#9A877E";
-  const snowColor      = settings.snowColor      ?? "#F3EFED";
-  const trackColor     = settings.trackColor     ?? "#FC5200";
-  const waterColor     = settings.waterColor     ?? "#306BA6";
-  const buildingsColor = settings.buildingsColor ?? "#777777";
-  const baseColor      = settings.baseColor      ?? "#FFFFFF";
-  const textColor      = settings.textColor      ?? "#000000";
+  const zoneColor = {
+    rock:      settings.rockColor      ?? "#9A877E",
+    forest:    settings.landColor      ?? "#327B4B",
+    water:     settings.waterColor     ?? "#306BA6",
+    snow:      settings.snowColor      ?? "#F3EFED",
+    buildings: settings.buildingsColor ?? "#777777",
+    base:      settings.baseColor      ?? "#FFFFFF",
+    text:      settings.textColor      ?? "#000000",
+  };
+  const trackColor = settings.trackColor ?? "#FC5200";
 
   geoGroup = new THREE.Group();
 
-  const terrain = await loader.loadAsync(`${base}/terrain.obj?v=${cacheKey}`);
-  applyColors(terrain, {
-    forest:    forestColor,
-    rock:      rockColor,
-    snow:      snowColor,
-    water:     waterColor,
-    buildings: buildingsColor,
-    base:      baseColor,
-    text:      textColor,
-  }, rockColor);
-  geoGroup.add(terrain);
-
+  const jobs = ZONE_NAMES.map(name =>
+    loadZone(`${base}/zone_${name}.stl?v=${cacheKey}`,
+             zoneColor[name], SMOOTH_ZONES.has(name)));
   for (let i = 0; i < trailAmount; i++) {
-    try {
-      const trail = await loader.loadAsync(`${base}/trail${i}.obj?v=${cacheKey}`);
-      applyColors(trail, {}, trackColor);
-      geoGroup.add(trail);
-    } catch (_) {
-      // Trail file may be empty/missing when a GPX had no usable points
-    }
+    jobs.push(loadZone(`${base}/trail${i}.stl?v=${cacheKey}`, trackColor, true));
+  }
+  for (const mesh of await Promise.all(jobs)) {
+    if (mesh) geoGroup.add(mesh);
+  }
+  if (geoGroup.children.length === 0) {
+    throw new Error("no model files found");
   }
 
   // Centre the model at origin, base on the ground plane

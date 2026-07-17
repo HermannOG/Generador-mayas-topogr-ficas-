@@ -61,6 +61,7 @@ DEFAULT_SETTINGS = {
     "snowLevel":             0,           # 0 none → 1 everything under snow
     "forestLevel":           0,           # 0 mapped forests only → 1 fully grown
     "heightScale":           1,
+    "standardizeHeight":     False,  # lock total model height to 45 mm
     "trailWidth":            1,
     "trailHeight":           1,
     "useHeightFromGpx":      False,
@@ -176,10 +177,11 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
         "target_size_mm":     base_size,
         "base_thickness_mm":  float(cfg["baseThickness"]),
         "height_scale":       max(0.0, float(cfg["heightScale"])),
+        "standardize_height": bool(cfg["standardizeHeight"]),
         "min_feature_mm":     2.0 * cell_mm,
         "smooth_zones":       bool(cfg["smooth"]),
         "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
-        "route_width_mm":     float(cfg["trailWidth"]),
+        "route_width_mm":     max(float(cfg["trailWidth"]), cell_mm),
         "route_height_mm":    float(cfg["trailHeight"]),
         "shape":              cfg["shape"],
         "border_mm":          max(6.0, 0.08 * base_size) if has_labels else 0.0,
@@ -198,7 +200,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     # The browser viewer gets a capped copy (0.4 mm) so it stays responsive;
     # the printable STLs use the full density — the slicer decides the rest.
     n_print = min(1100, round(base_size / cell_mm) + 1)
-    n_view = min(n_print, round(base_size / 0.4) + 1)
+    n_view = min(n_print, round(base_size / 0.2) + 1)
 
     progress("Downloading elevation data")
     grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, n_print)
@@ -268,17 +270,13 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
 
     use_gpx_ele = bool(cfg["useHeightFromGpx"])
 
-    # Viewer assets at the capped density: terrain.obj + trail{i}.obj
-    trail_view = [
-        gen_view.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
-        for t in trails
-    ]
+    # Viewer assets: one binary STL per colour zone at the view density
     border_view = gen_view.border_tris()
     zones_view["base"] = zones_view["base"] + border_view["base"]
     zones_view["text"] = border_view["text"]
-    (job_dir / "terrain.obj").write_bytes(gen_view.to_obj_bytes(zones_view))
-    for i, tris in enumerate(trail_view):
-        (job_dir / f"trail{i}.obj").write_bytes(gen_view.to_obj_bytes({"trail": tris}))
+    for name, tris in zones_view.items():
+        if tris:
+            (job_dir / f"zone_{name}.stl").write_bytes(gen_view.to_stl_bytes(tris))
 
     # Printable STLs at full fidelity
     if n_print != n_view:
@@ -286,10 +284,10 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     zones = (zones_view if n_print == n_view else
              gen.generate_zone_tris(grid, lat_b, lon_b, **zone_kwargs))
     printer = gen if n_print != n_view else gen_view
-    trail_tris = (trail_view if n_print == n_view else [
+    trail_tris = [
         printer.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
         for t in trails
-    ])
+    ]
     if n_print != n_view:
         border = printer.border_tris()
         zones["base"] = zones["base"] + border["base"]

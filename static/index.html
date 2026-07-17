@@ -127,18 +127,27 @@
           <div class="settings-group">
             <label>Height Scale
               <span class="info-icon-wrapper"><span class="info-icon">i</span>
-                <span class="info-tooltip">Elevation multiplier: Higher values make the hills and valleys stand out more in the 3D model.</span></span>
+                <span class="info-tooltip">Elevation multiplier over true scale (1 = real proportions). Higher values make hills and valleys stand out more.</span></span>
             </label>
             <div class="slider-row">
               <input type="range" min="0" max="5" step="0.1" data-setting="heightScale" />
               <input type="number" min="0" max="5" step="0.1" data-setting="heightScale" />
             </div>
+            <label>
+              <input type="checkbox" id="standardizeHeight" class="styled-checkbox" />
+              Standardize
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Locks the total model height — base bottom to the highest peak — to 45 mm, ignoring Height Scale.</span></span>
+            </label>
           </div>
           <div class="settings-group">
-            <label>Trail Width</label>
+            <label>Trail Width (mm)
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Printed width of the trail ribbon. Never below the chosen Resolution.</span></span>
+            </label>
             <div class="slider-row">
-              <input type="range" min="0" max="10" step="0.1" data-setting="trailWidth" />
-              <input type="number" min="0" max="10" step="0.1" data-setting="trailWidth" />
+              <input type="range" min="0.1" max="10" step="0.1" data-setting="trailWidth" />
+              <input type="number" min="0.1" max="10" step="0.1" data-setting="trailWidth" />
             </div>
           </div>
           <div class="settings-group">

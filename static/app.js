@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS = {
   snowLevel: 0,            // 0 none → 1 everything under snow
   forestLevel: 0,          // 0 mapped forests only → 1 fully grown
   heightScale: 1,
+  standardizeHeight: false,   // lock total model height to 45 mm
   trailWidth: 1,
   trailHeight: 1,
   useHeightFromGpx: false,
@@ -52,7 +53,7 @@ const DEFAULT_SETTINGS = {
 // Panel inputs whose element id === settings key
 const COLOR_KEYS = ["waterColor", "landColor", "rockColor", "snowColor",
                     "trackColor", "buildingsColor", "baseColor", "textColor"];
-const CHECKBOX_KEYS = ["useHeightFromGpx", "smooth", "includeSeas",
+const CHECKBOX_KEYS = ["useHeightFromGpx", "standardizeHeight", "smooth", "includeSeas",
                        "includeLakes", "includeRivers", "buildings"];
 
 // Settings the site parses as numbers on change
