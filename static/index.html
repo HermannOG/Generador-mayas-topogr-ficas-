@@ -130,8 +130,8 @@
                 <span class="info-tooltip">Elevation multiplier: Higher values make the hills and valleys stand out more in the 3D model.</span></span>
             </label>
             <div class="slider-row">
-              <input type="range" min="0" max="25" step="0.1" data-setting="heightScale" />
-              <input type="number" min="0" max="25" step="0.1" data-setting="heightScale" />
+              <input type="range" min="0" max="5" step="0.1" data-setting="heightScale" />
+              <input type="number" min="0" max="5" step="0.1" data-setting="heightScale" />
             </div>
           </div>
           <div class="settings-group">
@@ -217,10 +217,14 @@
             </div>
           </div>
           <div class="settings-group">
-            <label>
-              <input type="checkbox" id="higherResolution" class="styled-checkbox" />
-              Higher Resolution (takes twice as long)
+            <label>Resolution
+              <span class="info-icon-wrapper"><span class="info-icon">i</span>
+                <span class="info-tooltip">Mesh fidelity: size of the smallest printed detail in millimetres. Finer takes longer to generate. The 3D preview is capped at 0.4 mm; the downloaded STL uses the full fidelity.</span></span>
             </label>
+            <label><input type="radio" name="printResolution" value="0.1" class="styled-radio" />0.1 mm (finest)</label>
+            <label><input type="radio" name="printResolution" value="0.2" class="styled-radio" />0.2 mm (default)</label>
+            <label><input type="radio" name="printResolution" value="0.4" class="styled-radio" />0.4 mm</label>
+            <label><input type="radio" name="printResolution" value="0.8" class="styled-radio" />0.8 mm (draft)</label>
           </div>
 
           <h2 class="category-title">Water</h2>

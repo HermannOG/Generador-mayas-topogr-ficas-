@@ -29,16 +29,16 @@ const DEFAULT_SETTINGS = {
   useHeightFromGpx: false,
   shape: "hexagon",
   distanceTrackToBorder: 0,   // extra margin beyond the built-in 5% minimum
-  baseThickness: 5,
+  baseThickness: 15,   // mm
   includeSeas: true,
   includeLakes: true,
   includeRivers: false,
-  base_size: 100,
+  base_size: 108,   // hexagon width, point to point (mm)
   center: "normal",
   buildings: false,
   building_scale: 1,
   buildingsColor: "#777777",
-  higherResolution: false,
+  printResolution: 0.2,   // mm per mesh cell: 0.1 / 0.2 / 0.4 / 0.8
   singleColor: false,
   singleColor_gap: 0.5,
   // TopoTrail extensions (not on topotrail.com): hexagon border with text
@@ -51,13 +51,13 @@ const DEFAULT_SETTINGS = {
 // Panel inputs whose element id === settings key
 const COLOR_KEYS = ["waterColor", "landColor", "rockColor", "snowColor",
                     "trackColor", "buildingsColor", "baseColor", "textColor"];
-const CHECKBOX_KEYS = ["useHeightFromGpx", "higherResolution", "includeSeas",
+const CHECKBOX_KEYS = ["useHeightFromGpx", "includeSeas",
                        "includeLakes", "includeRivers", "buildings"];
 
 // Settings the site parses as numbers on change
 const NUMERIC_KEYS = [
   "snowLevel", "forestLevel", "heightScale", "trailWidth", "trailHeight", "shapeWidth",
-  "shapeHeight", "distanceTrackToBorder", "baseThickness", "base_size",
+  "shapeHeight", "distanceTrackToBorder", "baseThickness", "base_size", "printResolution",
   "building_scale",
 ];
 
@@ -135,6 +135,11 @@ function syncPanel(s) {
     r.checked = r.value === s.center;
   });
 
+  // Resolution radios
+  document.querySelectorAll("input[name='printResolution']").forEach(r => {
+    r.checked = Number(r.value) === Number(s.printResolution);
+  });
+
   // Shape buttons
   document.querySelectorAll(".shape-button").forEach(b => {
     b.classList.toggle("selected", b.dataset.shape === s.shape);
@@ -164,6 +169,9 @@ function bindPanel() {
   });
   document.querySelectorAll("input[name='center']").forEach(r => {
     r.addEventListener("change", () => setSetting("center", r.value));
+  });
+  document.querySelectorAll("input[name='printResolution']").forEach(r => {
+    r.addEventListener("change", () => setSetting("printResolution", r.value));
   });
   document.querySelectorAll(".shape-button").forEach(b => {
     b.addEventListener("click", () => setSetting("shape", b.dataset.shape));

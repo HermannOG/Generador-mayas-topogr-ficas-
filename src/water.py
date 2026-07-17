@@ -78,9 +78,17 @@ def fetch_map_features(lat_min, lat_max, lon_min, lon_max, max_features=2000):
             continue
         coords = way_coords(way, nodes)
         if kind == "river":
-            # Rivers are linear ways, not rings — keep OSM point order
+            # Rivers are linear ways, not rings — keep OSM point order.
+            # Real width from the OSM tag when present, else typical widths
+            # by waterway class; the mesh drops rivers too narrow to print.
             if len(coords) >= 2:
-                water.append({"type": "river", "line": coords})
+                tags = way.get("tags") or {}
+                try:
+                    width_m = float(str(tags.get("width", "")).split()[0])
+                except (ValueError, IndexError):
+                    width_m = {"river": 20.0, "canal": 8.0,
+                               "stream": 4.0}.get(tags.get("waterway"), 10.0)
+                water.append({"type": "river", "line": coords, "width_m": width_m})
         else:
             _add(kind, coords, [])
 

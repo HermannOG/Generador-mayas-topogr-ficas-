@@ -71,12 +71,12 @@ DEFAULT_SETTINGS = {
     "includeSeas":           True,
     "includeLakes":          True,
     "includeRivers":         False,
-    "base_size":             100,
+    "base_size":             108,   # hexagon width, point to point (mm)
     "center":                "normal",
     "buildings":             False,
     "building_scale":        1,
     "buildingsColor":        "#777777",
-    "higherResolution":      False,
+    "printResolution":       0.2,   # mm per mesh cell: 0.1 / 0.2 / 0.4 / 0.8
     "singleColor":           False,
     "singleColor_gap":       0.5,
     # TopoTrail extensions (not on topotrail.com): hexagon border with text
@@ -169,18 +169,21 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     has_labels = cfg["shape"] == "hexagon" and any(x.strip() for x in labels)
     base_size = float(cfg["base_size"])
 
-    height_scale = max(0.1, float(cfg["heightScale"]))
-    gen = MeshGenerator({
+    # Physical print fidelity: mm per mesh cell (0.1 / 0.2 / 0.4 / 0.8)
+    cell_mm = min(0.8, max(0.1, float(cfg["printResolution"])))
+    mesh_cfg = {
         "target_size_mm":     base_size,
         "base_thickness_mm":  float(cfg["baseThickness"]),
-        "max_ele_height_mm":  15.0 * height_scale,
+        "height_scale":       max(0.0, float(cfg["heightScale"])),
+        "min_feature_mm":     2.0 * cell_mm,
         "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
         "route_width_mm":     float(cfg["trailWidth"]),
         "route_height_mm":    float(cfg["trailHeight"]),
         "shape":              cfg["shape"],
         "border_mm":          max(6.0, 0.08 * base_size) if has_labels else 0.0,
         "border_labels":      labels,
-    })
+    }
+    gen = MeshGenerator(mesh_cfg)
 
     # Zoom out until the whole route fits INSIDE the model shape (hexagon
     # corners cut into the bounding box) with 5% clearance by default;
@@ -189,11 +192,16 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     margin_frac = 0.05 + 0.5 * knob
     size_km = gen.fit_size_km(all_points, lat_c, lon_c, bounds["span_km"], margin_frac)
 
-    # Mesh density: the slicer decides how to print it — generate generously
-    resolution = 450 if cfg["higherResolution"] else 300
+    # Mesh density from the chosen fidelity: one cell per cell_mm of model.
+    # The browser viewer gets a capped copy (0.4 mm) so it stays responsive;
+    # the printable STLs use the full density — the slicer decides the rest.
+    n_print = min(1100, round(base_size / cell_mm) + 1)
+    n_view = min(n_print, round(base_size / 0.4) + 1)
 
     progress("Downloading elevation data")
-    grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
+    grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, n_print)
+    grid_view = grid if n_view == n_print else \
+        fetch_elevation_grid(lat_c, lon_c, size_km, n_view)[0]
 
     progress("Downloading map features (water, forests)")
     water_data, forest_data = None, None
@@ -222,16 +230,17 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     # For open seas/bays, SRTM returns ~0 m — use elevation threshold
     detect_ocean_m = 0.5 if cfg["includeSeas"] else None
 
-    zones = gen.generate_zone_tris(
-        grid, lat_b, lon_b,
+    zone_kwargs = dict(
         buildings=buildings_data, water=water_data, forests=forest_data,
         forest_level=float(cfg["forestLevel"]),
         snow_level=float(cfg["snowLevel"]), detect_ocean_m=detect_ocean_m,
     )
+    gen_view = MeshGenerator(mesh_cfg)
+    zones_view = gen_view.generate_zone_tris(grid_view, lat_b, lon_b, **zone_kwargs)
     # 2D map preview first — the client can show it while the 3D build runs
     job_dir.mkdir(parents=True, exist_ok=True)
     render_preview_png(
-        grid, gen.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
+        grid_view, gen_view.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
         [t["points"] for t in trails],
         {
             "forest": cfg["landColor"],
@@ -256,28 +265,41 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
         return
 
     use_gpx_ele = bool(cfg["useHeightFromGpx"])
-    trail_tris = [
-        gen.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
+
+    # Viewer assets at the capped density: terrain.obj + trail{i}.obj
+    trail_view = [
+        gen_view.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
         for t in trails
     ]
-    border = gen.border_tris()        # border slab + raised text labels
-    zones["base"] = zones["base"] + border["base"]   # walls/bottom + slab
-    zones["text"] = border["text"]
+    border_view = gen_view.border_tris()
+    zones_view["base"] = zones_view["base"] + border_view["base"]
+    zones_view["text"] = border_view["text"]
+    (job_dir / "terrain.obj").write_bytes(gen_view.to_obj_bytes(zones_view))
+    for i, tris in enumerate(trail_view):
+        (job_dir / f"trail{i}.obj").write_bytes(gen_view.to_obj_bytes({"trail": tris}))
+
+    # Printable STLs at full fidelity
+    if n_print != n_view:
+        progress("Building print-quality mesh")
+    zones = (zones_view if n_print == n_view else
+             gen.generate_zone_tris(grid, lat_b, lon_b, **zone_kwargs))
+    printer = gen if n_print != n_view else gen_view
+    trail_tris = (trail_view if n_print == n_view else [
+        printer.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
+        for t in trails
+    ])
+    if n_print != n_view:
+        border = printer.border_tris()
+        zones["base"] = zones["base"] + border["base"]
+        zones["text"] = border["text"]
 
     progress("Writing model files")
-
-    # Viewer assets: terrain.obj (zone groups) + one trail{i}.obj per GPX file
-    (job_dir / "terrain.obj").write_bytes(gen.to_obj_bytes(zones))
-    for i, tris in enumerate(trail_tris):
-        (job_dir / f"trail{i}.obj").write_bytes(gen.to_obj_bytes({"trail": tris}))
-
-    # Printable STLs: combined map + separate terrain/trails for multi-filament
     terrain_tris = [t for tris in zones.values() for t in tris]
     all_trail_tris = [t for tris in trail_tris for t in tris]
-    (job_dir / "map.stl").write_bytes(gen.to_stl_bytes(terrain_tris + all_trail_tris))
-    (job_dir / "terrain.stl").write_bytes(gen.to_stl_bytes(terrain_tris))
+    (job_dir / "map.stl").write_bytes(printer.to_stl_bytes(terrain_tris + all_trail_tris))
+    (job_dir / "terrain.stl").write_bytes(printer.to_stl_bytes(terrain_tris))
     for i, tris in enumerate(trail_tris):
-        (job_dir / f"trail{i}.stl").write_bytes(gen.to_stl_bytes(tris))
+        (job_dir / f"trail{i}.stl").write_bytes(printer.to_stl_bytes(tris))
 
     (job_dir / "meta.json").write_text(json.dumps({
         "settings":    cfg,

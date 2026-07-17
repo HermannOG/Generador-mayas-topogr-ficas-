@@ -19,17 +19,19 @@ from scipy.spatial import cKDTree
 import mapbox_earcut as earcut
 from shapely.geometry import LineString, Point, Polygon
 
-RIVER_WIDTH_M = 30.0     # river ribbon half-width on the ground (metres)
-RIVER_MIN_MM  = 0.5      # minimum printed river width on the model (mm)
+MAX_RELIEF_MM = 40.0     # safety cap on terrain relief above the base
 
 
 class MeshGenerator:
 
     def __init__(self, config=None):
         cfg = config or {}
-        self.target_size_mm  = cfg.get("target_size_mm",    100.0)
-        self.base_mm         = cfg.get("base_thickness_mm",   5.0)
-        self.max_ele_mm      = cfg.get("max_ele_height_mm",  20.0)
+        self.target_size_mm  = cfg.get("target_size_mm",    108.0)
+        self.base_mm         = cfg.get("base_thickness_mm",  15.0)
+        # Vertical scale: 1.0 = true scale (same mm-per-metre as horizontal)
+        self.height_scale    = cfg.get("height_scale",        1.0)
+        # Smallest printable feature (rivers narrower than this are dropped)
+        self.min_feature_mm  = cfg.get("min_feature_mm",      0.4)
         self.building_h_mm   = cfg.get("building_height_mm",  2.0)
         self.route_width_mm  = cfg.get("route_width_mm",      1.0)
         self.route_height_mm = cfg.get("route_height_mm",     1.0)
@@ -81,14 +83,25 @@ class MeshGenerator:
             elevation_grid, water, detect_ocean_m=detect_ocean_m)
         self.last_water_mask = water_mask
 
-        # Water bodies may sit below the previous global minimum after
-        # carving; refresh the vertical mapping so z stays in range.
-        self.ele_min = float(np.nanmin(grid))
-        self.ele_max = float(np.nanmax(grid))
-        self.sz = self.max_ele_mm / max(self.ele_max - self.ele_min, 1.0)
-        self._refresh_interp(grid)
-
         rows, cols = grid.shape
+
+        # Vertical datum: the LOWEST terrain on the model's cut edge sits
+        # exactly at the base top, so e.g. a lake reaching the edge is level
+        # with the border ring. Anything lower in the interior clamps to the
+        # base (ele_to_z never goes below it).
+        self.ele_max = float(np.nanmax(grid))
+        self.ele_min = float(np.nanmin(grid))
+        shape_mask = self._rasterize_xy_poly(self._shape_poly, rows, cols)
+        ring = shape_mask & ~binary_erosion(shape_mask)
+        if ring.any():
+            self.ele_min = float(np.nanmin(grid[ring]))
+            # Water reaching the edge defines the base level exactly — the
+            # lake surface sits flush with the border ring (exposed banks
+            # below it clamp up to the base and read as shore)
+            if water_mask is not None and (ring & water_mask).any():
+                self.ele_min = float(np.nanmin(grid[ring & water_mask]))
+        self.sz = self._vertical_scale(self.ele_max - self.ele_min)
+        self._refresh_interp(grid)
         zone_map = self._build_zone_map(grid, water_mask, forests,
                                         forest_level, snow_level)
         self.last_zone_map = zone_map
@@ -140,6 +153,13 @@ class MeshGenerator:
             zone[snow_mask] = self.Z_SNOW
         if water_mask is not None:
             zone[water_mask] = self.Z_WATER
+        # Frozen lakes: a lake whose entire shore is snowed-in reads as snow
+        # too (it stays flat — which is exactly what a frozen lake looks like)
+        if snow_mask is not None:
+            for mask in getattr(self, "_lake_masks", []):
+                ring = binary_dilation(mask) & ~mask
+                if ring.any() and snow_mask[ring].mean() > 0.9:
+                    zone[mask] = self.Z_SNOW
         return zone
 
     def _grow_forest_mask(self, grid, base_mask, water_mask, forest_level, slope):
@@ -315,8 +335,9 @@ class MeshGenerator:
         self.lat_min, self.lat_max = lat_min, lat_max
         self.lon_min, self.lon_max = lon_min, lon_max
 
+        # Point-to-point width of the shape = the full model size
         cx, cy = self.model_w / 2, self.model_h / 2
-        r = min(cx, cy) * 0.98
+        r = min(cx, cy)
         if self.border_mm > 0:
             self._outer_poly = self._make_shape(cx, cy, r)
             self._shape_poly = self._make_shape(cx, cy, max(r - self.border_mm, r * 0.3))
@@ -324,13 +345,22 @@ class MeshGenerator:
             self._outer_poly = None
             self._shape_poly = self._make_shape(cx, cy, r)
 
+    def _vertical_scale(self, ele_range_m):
+        """
+        mm of model height per metre of elevation. height_scale 1.0 means
+        TRUE scale (identical to the horizontal scale); the relief is capped
+        at MAX_RELIEF_MM so extreme scales stay printable.
+        """
+        sz = self.sxy * max(0.0, float(self.height_scale))
+        rng = max(float(ele_range_m), 1.0)
+        return min(sz, MAX_RELIEF_MM / rng)
+
     def _setup(self, grid, lat_bounds, lon_bounds):
         self._frame(lat_bounds, lon_bounds)
 
         self.ele_min = float(np.nanmin(grid))
         self.ele_max = float(np.nanmax(grid))
-        ele_range    = max(self.ele_max - self.ele_min, 1.0)
-        self.sz      = self.max_ele_mm / ele_range
+        self.sz = self._vertical_scale(self.ele_max - self.ele_min)
 
         self.rows, self.cols = grid.shape
         self._refresh_interp(grid)
@@ -409,7 +439,10 @@ class MeshGenerator:
         return lat, lon
 
     def ele_to_z(self, ele):
-        return (ele - self.ele_min) * self.sz + self.base_mm
+        # Never below the base top: interior terrain under the edge datum
+        # (e.g. a valley lower than the model's cut edge) sits on the base
+        return np.maximum((ele - self.ele_min) * self.sz + self.base_mm,
+                          self.base_mm)
 
     def z_at(self, lat, lon):
         return self.ele_to_z(float(self._interp([[lat, lon]])[0]))
@@ -570,8 +603,11 @@ class MeshGenerator:
         for w in water_features or []:
             if w["type"] == "river":
                 line = w.get("line") or []
-                if len(line) >= 2:
-                    rivers.append(line)
+                # Rivers render at their REAL width — ones too narrow to
+                # print at the chosen resolution are simply not shown.
+                width_mm = w.get("width_m", 10.0) * self.sxy
+                if len(line) >= 2 and width_mm >= self.min_feature_mm:
+                    rivers.append((line, width_mm))
             elif len(w.get("coords", [])) >= 3:
                 (seas if w["type"] == "sea" else lakes).append(w)
 
@@ -580,6 +616,7 @@ class MeshGenerator:
         # a lake polygon cannot be trusted: reservoirs may show the dry basin
         # floor or a lower water stage than the mapped (full-pool) outline —
         # only the terrain just outside the outline is reliable.
+        self._lake_masks = []
         for lake in lakes:
             mask = self._mask_from_feature(lake, rows, cols)
             if mask.any():
@@ -589,6 +626,7 @@ class MeshGenerator:
                 level_cells = rim if rim.any() else mask
                 out[mask] = float(np.median(grid[level_cells]))
                 merged |= mask
+                self._lake_masks.append(mask)
 
         # Seas: flatten to the map minimum
         sea_mask = np.zeros((rows, cols), dtype=bool)
@@ -606,7 +644,7 @@ class MeshGenerator:
         # other rivers/lakes stay consistent (a min-only op, so it converges).
         cell_mm = self.model_w / max(cols - 1, 1)
         prepared = []
-        for line in rivers:
+        for line, width_mm in rivers:
             raw_xy = np.array([self.ll_to_xy(lat, lon) for lat, lon in line])
             if len(raw_xy) < 2:
                 continue
@@ -626,8 +664,7 @@ class MeshGenerator:
 
             # Ribbon polygon can be thinner than a grid cell — draw the
             # polyline too so every cell under the river is covered.
-            # Enforce a minimum printed width so rivers stay visible.
-            radius_mm = max(RIVER_WIDTH_M * self.sxy, RIVER_MIN_MM / 2.0)
+            radius_mm = width_mm / 2.0
             ribbon = ls.buffer(radius_mm)
             width_px = max(1, round(2 * radius_mm / cell_mm))
             mask = (self._rasterize_xy_poly(ribbon, rows, cols)
@@ -807,9 +844,13 @@ class MeshGenerator:
         if self.border_mm <= 0 or self._outer_poly is None:
             return {"base": [], "text": []}
 
-        # Slab prism: hexagon top at base_mm (under the terrain — internal
-        # where covered, visible on the ring), bottom at 0, outer walls.
-        base = []
+        # Slab: top face is only the visible RING (the terrain provides the
+        # surface inside — a full top face would be coplanar with edge-level
+        # water and z-fight), plus bottom at 0 and outer walls. The terrain's
+        # walls end exactly on the ring's inner edge, closing the solid.
+        ring_poly = self._outer_poly.difference(self._shape_poly)
+        base = self._top_tris_from_polys(ring_poly, lambda x, y: self.base_mm)
+
         coords = list(self._outer_poly.exterior.coords)[:-1]
         c = self._outer_poly.centroid
         pcx, pcy = c.x, c.y
@@ -817,7 +858,6 @@ class MeshGenerator:
         for k in range(n):
             ax, ay = coords[k]
             bx, by = coords[(k + 1) % n]
-            base.append(([pcx, pcy, self.base_mm], [ax, ay, self.base_mm], [bx, by, self.base_mm]))
             base.append(([pcx, pcy, 0.0], [bx, by, 0.0], [ax, ay, 0.0]))
             base.append(([ax, ay, 0.0], [bx, by, self.base_mm], [bx, by, 0.0]))
             base.append(([ax, ay, 0.0], [ax, ay, self.base_mm], [bx, by, self.base_mm]))
@@ -827,7 +867,7 @@ class MeshGenerator:
 
         text = []
         cx, cy = self.model_w / 2, self.model_h / 2
-        R = min(cx, cy) * 0.98            # outer hexagon circumradius = side length
+        R = min(cx, cy)                   # outer hexagon circumradius = side length
         apothem = R * math.cos(math.pi / 6)
         band_center = apothem - 0.433 * self.border_mm  # radial middle of the ring
 
@@ -980,6 +1020,13 @@ class MeshGenerator:
         # Buffer the 2D path → smooth ribbon (round joins, flat end caps),
         # clipped to the model shape so the trail never spills over the edge
         ribbon = path.buffer(hw, cap_style=2, join_style=1, resolution=8)
+
+        # Out-and-back passes that don't retrace exactly leave a lumpy double
+        # line; morphological closing merges passes within ~1.5 trail-widths
+        # into one clean ribbon.
+        m = hw * 0.75
+        ribbon = ribbon.buffer(m).buffer(-m)
+
         ribbon = ribbon.intersection(self._shape_poly)
         if ribbon.is_empty:
             return []
