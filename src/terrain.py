@@ -133,7 +133,9 @@ def _fetch_from_tiles(lat_center, lon_center, size_km, resolution):
         + mosaic[y0 + 1, x0 + 1] * fx       * fy
     ).astype(float)
 
-    grid = gaussian_filter(grid, sigma=1.0)
+    # Smooth in proportion to mesh density so "Higher Resolution" yields a
+    # finer AND smoother surface rather than just more, noisier triangles
+    grid = gaussian_filter(grid, sigma=max(1.0, resolution / 300.0))
     return grid, (lat_min, lat_max), (lon_min, lon_max)
 
 

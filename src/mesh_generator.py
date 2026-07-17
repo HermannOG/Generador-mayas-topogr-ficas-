@@ -16,8 +16,8 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import (binary_dilation, binary_erosion,
                            distance_transform_edt, gaussian_filter)
 from scipy.spatial import cKDTree
+import mapbox_earcut as earcut
 from shapely.geometry import LineString, Point, Polygon
-from shapely.ops import triangulate as shp_triangulate
 
 RIVER_WIDTH_M = 30.0     # river ribbon half-width on the ground (metres)
 RIVER_MIN_MM  = 0.5      # minimum printed river width on the model (mm)
@@ -44,11 +44,14 @@ class MeshGenerator:
     # ── Public API ────────────────────────────────────────────────────────
 
     # Zone ids used in the per-cell zone map (thumbnail + classification)
-    ZONES = ("sand", "forest", "rock", "water", "snow")
-    Z_SAND, Z_FOREST, Z_ROCK, Z_WATER, Z_SNOW = range(5)
+    ZONES = ("rock", "forest", "water", "snow")
+    Z_ROCK, Z_FOREST, Z_WATER, Z_SNOW = range(4)
 
-    # Ground steeper than this (rise/run) reads as bare rock, not sand
+    # Slope used by forest growth as "too steep for trees" (rise/run)
     ROCK_SLOPE = 0.45
+
+    # Cut-wall crust: how deep the surface colour extends down the sides
+    CRUST_MM = 1.2
 
     def generate_zone_tris(self, elevation_grid, lat_bounds, lon_bounds,
                            buildings=None, water=None, forests=None,
@@ -56,15 +59,15 @@ class MeshGenerator:
         """
         Generate terrain geometry split into colour zones.
         Returns dict of triangle lists:
-          {"sand", "forest", "rock", "water", "snow", "buildings", "base"}
-        Only the top SURFACE gets terrain colours — side walls and the bottom
-        go into "base" so the model sides always match the base colour.
+          {"rock", "forest", "water", "snow", "buildings", "base"}
+        The surface AND a thin crust band down the cut sides take the zone
+        colours (geological cross-section); the wall body below the crust is
+        rock, and the bottom face/border slab stay base-coloured.
 
         Ground classification:
           forest : mapped OSM forest polygons (real tree edges), procedurally
                    grown outward as forest_level rises 0 → 1
-          rock   : steep bare ground (slope above ROCK_SLOPE)
-          sand   : the remaining gentle ground
+          rock   : all remaining bare ground
           snow   : procedural snow cover, snow_level 0 (none) → 1 (everything)
         detect_ocean_m: if not None, cells with original elevation <= this
         value (metres) are treated as sea/ocean.
@@ -90,11 +93,15 @@ class MeshGenerator:
                                         forest_level, snow_level)
         self.last_zone_map = zone_map
 
-        surface_tris, wall_tris = self._terrain(grid)
+        surface_tris, crust_tris, body_tris, bottom_tris = self._terrain(grid)
 
         zones = {name: [] for name in self.ZONES}
-        tris = np.asarray(surface_tris, dtype=np.float64)
-        if tris.size:
+        # Surface and crust walls take the zone colour of their cell; the
+        # wall body below the crust is always rock.
+        for tri_list in (surface_tris, crust_tris):
+            tris = np.asarray(tri_list, dtype=np.float64)
+            if not tris.size:
+                continue
             # Classify by centroid cell. Floor (not round) so both triangles
             # of a quad land in the same cell — otherwise thin features like
             # rivers render dashed.
@@ -104,21 +111,21 @@ class MeshGenerator:
             i = np.clip(((1.0 - cy / self.model_h) * (rows - 1)).astype(int), 0, rows - 1)
             tri_zone = zone_map[i, j]
             for zid, name in enumerate(self.ZONES):
-                zones[name] = tris[tri_zone == zid].tolist()
+                zones[name].extend(tris[tri_zone == zid].tolist())
 
+        zones["rock"].extend(body_tris)
         zones["buildings"] = self._buildings(buildings) if buildings else []
-        zones["base"] = wall_tris
+        zones["base"] = bottom_tris
         return zones
 
     def _build_zone_map(self, grid, water_mask, forests, forest_level, snow_level):
-        """Per-cell zone ids: sand/forest/rock ground, then snow, then water."""
+        """Per-cell zone ids: rock/forest ground, then snow, then water."""
         rows, cols = grid.shape
 
-        # Ground: gentle = sand, steep = rock
         cell_m = max((self.lat_max - self.lat_min) * 111_000 / max(rows - 1, 1), 1.0)
         gy, gx = np.gradient(grid, cell_m)
         slope = np.hypot(gx, gy)
-        zone = np.where(slope >= self.ROCK_SLOPE, self.Z_ROCK, self.Z_SAND).astype(np.uint8)
+        zone = np.full((rows, cols), self.Z_ROCK, dtype=np.uint8)
 
         # Forests: real OSM outlines as the baseline, grown procedurally
         forest_mask = np.zeros((rows, cols), dtype=bool)
@@ -243,9 +250,24 @@ class MeshGenerator:
             return []
         flat_z = None
         if flat:
-            zs = [self.z_at(p[0], p[1]) for p in gpx_points[::max(1, len(gpx_points) // 200)]
-                  if self._in_bounds(p[0], p[1])]
-            if zs:
+            # A swim sits ON the water: use the water surface height under the
+            # path (not the median terrain, which mixes in shore points)
+            zs, zs_water = [], []
+            rows, cols = self.rows, self.cols
+            for p in gpx_points[::max(1, len(gpx_points) // 300)]:
+                if not self._in_bounds(p[0], p[1]):
+                    continue
+                z = self.z_at(p[0], p[1])
+                zs.append(z)
+                if self.last_water_mask is not None:
+                    x, y = self.ll_to_xy(p[0], p[1])
+                    j = min(cols - 1, max(0, int(x / self.model_w * (cols - 1))))
+                    i = min(rows - 1, max(0, int((1.0 - y / self.model_h) * (rows - 1))))
+                    if self.last_water_mask[i, j]:
+                        zs_water.append(z)
+            if zs_water:
+                flat_z = float(np.median(zs_water)) + 0.15   # float on the surface
+            elif zs:
                 flat_z = float(np.median(zs))
         return self._route(gpx_points, flat_z=flat_z,
                            use_gpx_ele=use_gpx_ele and flat_z is None)
@@ -456,16 +478,26 @@ class MeshGenerator:
     # ── Shared solid-building helpers ────────────────────────────────────
 
     def _top_tris_from_polys(self, geom, z_fn):
-        """Triangulate a (multi)polygon → CCW top-face tris, z from z_fn(x, y)."""
+        """
+        Triangulate a (multi)polygon → CCW top-face tris, z from z_fn(x, y).
+        Uses earcut, which handles holes (letter glyphs, islands) and never
+        drops slivers — the old Delaunay+filter approach left holes in trail
+        ribbons and mangled border text.
+        """
         polys = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
         tris = []
         for poly in polys:
             if poly.is_empty or poly.geom_type != "Polygon":
                 continue
-            for t in shp_triangulate(poly):
-                if not poly.contains(t.centroid):
-                    continue
-                c = list(t.exterior.coords)[:3]
+            rings = [list(poly.exterior.coords[:-1])]
+            rings += [list(r.coords[:-1]) for r in poly.interiors]
+            verts = np.array([p for ring in rings for p in ring], dtype=np.float64)
+            if len(verts) < 3:
+                continue
+            ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+            idx = earcut.triangulate_float64(verts, ring_ends)
+            for k in range(0, len(idx), 3):
+                c = verts[[idx[k], idx[k + 1], idx[k + 2]]]
                 tv = [[x, y, z_fn(x, y)] for x, y in c]
                 cz = ((tv[1][0]-tv[0][0])*(tv[2][1]-tv[0][1]) -
                       (tv[1][1]-tv[0][1])*(tv[2][0]-tv[0][0]))
@@ -639,14 +671,23 @@ class MeshGenerator:
         Z = self.ele_to_z(elevation_grid)
         V = np.stack([X, Y, Z], axis=-1)
 
-        # Inside-shape mask via rasterisation
-        inside = self._rasterize_xy_poly(self._shape_poly, rows, cols)
+        # Quad classification against the model shape. Rasterisation alone is
+        # half-a-cell sloppy and produced sawtooth edges — use a STRICT mask
+        # (shape shrunk by a cell) for guaranteed-inside full quads and a
+        # LOOSE mask (shape grown by a cell) to find candidates for exact
+        # shapely clipping, so the cut lands precisely on the shape outline.
+        cell_mm = self.model_w / max(cols - 1, 1)
+        inside_strict = self._rasterize_xy_poly(
+            self._shape_poly.buffer(-1.6 * cell_mm), rows, cols)
+        inside_loose = self._rasterize_xy_poly(
+            self._shape_poly.buffer(+1.6 * cell_mm), rows, cols)
 
-        # Quad classification
-        n_in = (inside[:-1, :-1].astype(np.int8) + inside[:-1, 1:] +
-                inside[1:, 1:] + inside[1:, :-1])
-        full    = n_in == 4
-        partial = (n_in > 0) & (n_in < 4)
+        n_strict = (inside_strict[:-1, :-1].astype(np.int8) + inside_strict[:-1, 1:] +
+                    inside_strict[1:, 1:] + inside_strict[1:, :-1])
+        n_loose = (inside_loose[:-1, :-1].astype(np.int8) + inside_loose[:-1, 1:] +
+                   inside_loose[1:, 1:] + inside_loose[1:, :-1])
+        full    = n_strict == 4
+        partial = ~full & (n_loose > 0)
 
         # Only quads near the boundary need slow edge bookkeeping; strictly
         # interior full quads can never contribute boundary edges. The grid
@@ -706,23 +747,32 @@ class MeshGenerator:
                         top_tris.append((v0, v1, v2) if cz >= 0 else (v0, v2, v1))
 
         surface = fast_tris + list(top_tris)
-        walls = []
+        crust, body = [], []
         bot_pts = []
 
         # With a border, the terrain sits ON the base slab: walls stop at the
         # slab top and the slab provides the bottom face.
         floor_z = self.base_mm if self.border_mm > 0 else 0.0
 
-        # ── Smooth walls: drop each boundary edge straight to the floor ──
+        # ── Walls: a thin CRUST band under the surface takes the surface
+        # zone colour (cutting through snow shows a white line, through a
+        # lake a blue line), and the BODY below reads as rock — like a
+        # geological cross-section.
         for t1, t2 in self._boundary_edges(top_tris):
-            b1 = [t1[0], t1[1], floor_z]
-            b2 = [t2[0], t2[1], floor_z]
-            walls.append((t2, t1, b1))   # outward-facing (right of t1→t2)
-            walls.append((t2, b1, b2))
+            c1 = [t1[0], t1[1], max(t1[2] - self.CRUST_MM, floor_z)]
+            c2 = [t2[0], t2[1], max(t2[2] - self.CRUST_MM, floor_z)]
+            crust.append((t2, t1, c1))   # outward-facing (right of t1→t2)
+            crust.append((t2, c1, c2))
+            if c1[2] > floor_z + 1e-9 or c2[2] > floor_z + 1e-9:
+                b1 = [t1[0], t1[1], floor_z]
+                b2 = [t2[0], t2[1], floor_z]
+                body.append((c2, c1, b1))
+                body.append((c2, b1, b2))
             bot_pts.append((t1[0], t1[1]))
             bot_pts.append((t2[0], t2[1]))
 
         # ── Bottom face: sort boundary projection by angle, fan-tri ──────
+        bottom = []
         if bot_pts and self.border_mm <= 0:
             cx, cy = self.model_w / 2, self.model_h / 2
             seen, uniq = set(), []
@@ -737,9 +787,9 @@ class MeshGenerator:
                 for k in range(n):
                     p0 = [uniq[k][0],         uniq[k][1],         0.0]
                     p1 = [uniq[(k+1) % n][0], uniq[(k+1) % n][1], 0.0]
-                    walls.append((cpt, p1, p0))  # -Z normal
+                    bottom.append((cpt, p1, p0))  # -Z normal
 
-        return surface, walls
+        return surface, crust, body, bottom
 
     # ── Border ring + text labels (hexagon) ──────────────────────────────
 
@@ -898,11 +948,16 @@ class MeshGenerator:
 
             z_bottom = (lambda x, y: flat_z)
         elif use_gpx_ele:
-            # Height from the GPX file's own elevation (nearest track point)
+            # Height from the GPX file's own elevation (nearest track point).
+            # GPS altitude is noisy — smooth it with a moving average first,
+            # otherwise the ribbon jumps step to step.
             in_pts = [(self.ll_to_xy(p[0], p[1]), p[2]) for p in points
                       if self._in_bounds(p[0], p[1])]
             kd = cKDTree([xy for xy, _ in in_pts])
-            eles = np.array([e for _, e in in_pts])
+            eles = np.array([e for _, e in in_pts], dtype=float)
+            win = max(3, min(31, len(eles) // 50) | 1)
+            kernel = np.ones(win) / win
+            eles = np.convolve(np.pad(eles, win // 2, mode="edge"), kernel, "valid")
 
             def z_gpx(x, y):
                 return self.ele_to_z(float(eles[kd.query((x, y))[1]]))
@@ -920,7 +975,7 @@ class MeshGenerator:
             z_bottom = z_terrain
 
         # Simplify before buffering to remove GPS-noise zigzags
-        path = LineString(pts2d).simplify(hw * 0.8, preserve_topology=True)
+        path = LineString(pts2d).simplify(hw * 0.5, preserve_topology=True)
 
         # Buffer the 2D path → smooth ribbon (round joins, flat end caps),
         # clipped to the model shape so the trail never spills over the edge
@@ -928,6 +983,12 @@ class MeshGenerator:
         ribbon = ribbon.intersection(self._shape_poly)
         if ribbon.is_empty:
             return []
+
+        # Densify the ribbon outline so the top surface actually FOLLOWS the
+        # terrain: with sparse vertices the long triangles bridge over hills
+        # and dip underground in valleys.
+        cell_mm = self.model_w / max(self.cols - 1, 1)
+        ribbon = ribbon.segmentize(max(cell_mm * 0.5, hw * 0.4))
 
         return self._prism_tris(ribbon, z_top, z_bottom)
 

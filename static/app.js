@@ -13,14 +13,14 @@
 const API_BASE = "/api";
 
 // Settings schema follows topotrail.com (camelCase) with TopoTrail
-// extensions. Colours default to a retro national-park palette.
+// extensions. Colours are derived from the Strava-orange trail (#FC5200):
+// hues rotated, lightness/saturation kept in the same family.
 const DEFAULT_SETTINGS = {
-  waterColor: "#4A7A8C",   // dusty teal
-  landColor: "#667C4E",    // forest olive
+  waterColor: "#306BA6",   // complementary blue
+  landColor: "#327B4B",    // forest green
   trackColor: "#FC5200",
-  rockColor: "#8C7A6B",    // warm taupe
-  sandColor: "#D9BE8C",    // tan
-  snowColor: "#EFEBE2",    // cream
+  rockColor: "#9A877E",    // same hue as the trail, desaturated
+  snowColor: "#F3EFED",    // near-white, warm cast
   snowLevel: 0,            // 0 none → 1 everything under snow
   forestLevel: 0,          // 0 mapped forests only → 1 fully grown
   heightScale: 1,
@@ -49,9 +49,8 @@ const DEFAULT_SETTINGS = {
 };
 
 // Panel inputs whose element id === settings key
-const COLOR_KEYS = ["waterColor", "landColor", "sandColor", "rockColor",
-                    "snowColor", "trackColor", "buildingsColor", "baseColor",
-                    "textColor"];
+const COLOR_KEYS = ["waterColor", "landColor", "rockColor", "snowColor",
+                    "trackColor", "buildingsColor", "baseColor", "textColor"];
 const CHECKBOX_KEYS = ["useHeightFromGpx", "higherResolution", "includeSeas",
                        "includeLakes", "includeRivers", "buildings"];
 

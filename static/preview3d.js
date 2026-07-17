@@ -13,7 +13,7 @@ import { mergeVertices } from "three/addons/utils/BufferGeometryUtils.js";
 
 // Terrain zones get welded vertices + smooth normals; base/text keep
 // crisp flat shading (walls and letters should stay sharp)
-const SMOOTH_ZONES = new Set(["sand", "forest", "rock", "snow", "water", "trail"]);
+const SMOOTH_ZONES = new Set(["forest", "rock", "snow", "water", "trail"]);
 
 let renderer, scene, camera, controls;
 let animId = null;
@@ -93,12 +93,11 @@ function applyColors(objRoot, colorByName, fallback, smoothFallback = false) {
 async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
   if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
 
-  const forestColor    = settings.landColor      ?? "#667C4E";
-  const rockColor      = settings.rockColor      ?? "#8C7A6B";
-  const sandColor      = settings.sandColor      ?? "#D9BE8C";
-  const snowColor      = settings.snowColor      ?? "#EFEBE2";
+  const forestColor    = settings.landColor      ?? "#327B4B";
+  const rockColor      = settings.rockColor      ?? "#9A877E";
+  const snowColor      = settings.snowColor      ?? "#F3EFED";
   const trackColor     = settings.trackColor     ?? "#FC5200";
-  const waterColor     = settings.waterColor     ?? "#4A7A8C";
+  const waterColor     = settings.waterColor     ?? "#306BA6";
   const buildingsColor = settings.buildingsColor ?? "#777777";
   const baseColor      = settings.baseColor      ?? "#FFFFFF";
   const textColor      = settings.textColor      ?? "#000000";
@@ -108,14 +107,13 @@ async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 })
   const terrain = await loader.loadAsync(`${base}/terrain.obj?v=${cacheKey}`);
   applyColors(terrain, {
     forest:    forestColor,
-    sand:      sandColor,
     rock:      rockColor,
     snow:      snowColor,
     water:     waterColor,
     buildings: buildingsColor,
     base:      baseColor,
     text:      textColor,
-  }, sandColor);
+  }, rockColor);
   geoGroup.add(terrain);
 
   for (let i = 0; i < trailAmount; i++) {

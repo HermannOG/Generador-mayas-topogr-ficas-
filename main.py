@@ -49,14 +49,15 @@ GPX_STORE     = GENERATED_DIR / "gpx"
 JOB_TTL_S     = 24 * 3600
 
 # Settings schema follows the topotrail.com front-end (camelCase), with
-# TopoTrail extensions. Colours default to a retro national-park palette.
+# TopoTrail extensions. Colours are derived from the Strava-orange trail
+# (#FC5200, HSL h20/s1.0/l0.49): hues rotated, lightness/saturation kept in
+# the same family so the palette reads as one system.
 DEFAULT_SETTINGS = {
-    "waterColor":            "#4A7A8C",   # dusty teal
-    "landColor":             "#667C4E",   # forest olive
+    "waterColor":            "#306BA6",   # h210, complementary blue
+    "landColor":             "#327B4B",   # forest, h140
     "trackColor":            "#FC5200",
-    "rockColor":             "#8C7A6B",   # warm taupe
-    "sandColor":             "#D9BE8C",   # tan
-    "snowColor":             "#EFEBE2",   # cream
+    "rockColor":             "#9A877E",   # same h20 hue, desaturated
+    "snowColor":             "#F3EFED",   # near-white, warm cast
     "snowLevel":             0,           # 0 none → 1 everything under snow
     "forestLevel":           0,           # 0 mapped forests only → 1 fully grown
     "heightScale":           1,
@@ -65,7 +66,8 @@ DEFAULT_SETTINGS = {
     "useHeightFromGpx":      False,
     "shape":                 "hexagon",
     "distanceTrackToBorder": 0,
-    "baseThickness":         5,
+    # Base 15 mm (0.591") and relief 15 mm → 30 mm (1.182") total model height
+    "baseThickness":         15,
     "includeSeas":           True,
     "includeLakes":          True,
     "includeRivers":         False,
@@ -171,7 +173,7 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     gen = MeshGenerator({
         "target_size_mm":     base_size,
         "base_thickness_mm":  float(cfg["baseThickness"]),
-        "max_ele_height_mm":  20.0 * height_scale,
+        "max_ele_height_mm":  15.0 * height_scale,
         "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
         "route_width_mm":     float(cfg["trailWidth"]),
         "route_height_mm":    float(cfg["trailHeight"]),
@@ -187,7 +189,8 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
     margin_frac = 0.05 + 0.5 * knob
     size_km = gen.fit_size_km(all_points, lat_c, lon_c, bounds["span_km"], margin_frac)
 
-    resolution = 300 if cfg["higherResolution"] else 200
+    # Mesh density: the slicer decides how to print it — generate generously
+    resolution = 450 if cfg["higherResolution"] else 300
 
     progress("Downloading elevation data")
     grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, resolution)
@@ -231,7 +234,6 @@ def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
         grid, gen.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
         [t["points"] for t in trails],
         {
-            "sand":   cfg["sandColor"],
             "forest": cfg["landColor"],
             "rock":   cfg["rockColor"],
             "water":  cfg["waterColor"],
