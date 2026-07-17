@@ -1,6 +1,7 @@
+import math
+
 import gpxpy
 import gpxpy.gpx
-import math
 
 
 def parse_gpx_with_type(file_content):

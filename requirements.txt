@@ -10,3 +10,8 @@ numpy-stl>=3.0.0
 pillow>=10.0.0
 matplotlib>=3.8.0
 mapbox_earcut>=1.0.0
+
+# dev
+pytest
+ruff
+pydantic

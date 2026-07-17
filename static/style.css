@@ -74,3 +74,229 @@ body{background-color:#ebfaff}.page-content{padding-left:20px;padding-right:20px
 }
 .map-preview[hidden],
 .loading-map-preview[hidden] { display: none !important; }
+
+/* ── Non-blocking progress strip (replaces the full-screen overlay) ────── */
+.progress-strip {
+  align-items: center;
+  background: #fffffff2;
+  border: 1px solid #e3e8ee;
+  border-radius: 12px;
+  box-shadow: 0 4px 14px #00000022;
+  display: flex;
+  gap: 12px;
+  left: 22px;
+  padding: 10px 14px;
+  position: absolute;
+  right: 22px;
+  top: 22px;
+  z-index: 6;
+}
+.progress-strip[hidden] { display: none !important; }
+.progress-spinner {
+  animation: spin 0.9s linear infinite;
+  border: 3px solid #ffd9c2;
+  border-radius: 50%;
+  border-top-color: #FC5200;
+  flex: 0 0 auto;
+  height: 22px;
+  width: 22px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.progress-info { flex: 1 1 auto; min-width: 0; text-align: left; }
+.progress-stage {
+  color: #333;
+  font-size: 0.95rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.progress-donate { color: #656565; font-size: 0.8rem; }
+.progress-donate .donate-link { color: #FC5200; font-weight: 600; text-decoration: none; }
+.progress-donate .donate-link:hover { text-decoration: underline; }
+.progress-map-preview {
+  border-radius: 8px;
+  box-shadow: 0 2px 8px #00000022;
+  flex: 0 0 auto;
+  max-height: 56px;
+  max-width: 90px;
+}
+.progress-map-preview[hidden] { display: none !important; }
+.cancel-button {
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  color: #444;
+  cursor: pointer;
+  flex: 0 0 auto;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 8px 14px;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.cancel-button:hover { background: #ffece2; border-color: #FC5200; color: #FC5200; }
+
+/* ── Dirty state: regenerate needed ────────────────────────────────────── */
+.dirty-hint {
+  color: #b93c00;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 6px 8px 0;
+  text-align: center;
+}
+.dirty-hint[hidden] { display: none !important; }
+.update-button.dirty {
+  outline: 2px solid #FC5200;
+  outline-offset: 2px;
+  position: relative;
+}
+.update-button.dirty::after {
+  background: #FC5200;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  content: "";
+  height: 10px;
+  position: absolute;
+  right: -5px;
+  top: -5px;
+  width: 10px;
+}
+.download-button.stale {
+  background: #8a6d00;
+}
+.download-button.stale:hover { background: #6f5800; }
+
+/* Disabled states for action buttons */
+.download-button:disabled,
+.update-button:disabled {
+  background: #b9c4cc;
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none;
+}
+.download-button:disabled:hover,
+.update-button:disabled:hover {
+  background: #b9c4cc;
+  transform: none;
+}
+
+/* ── Tiles: delete button + generating badge, keyboard focus ───────────── */
+.tile-delete {
+  align-items: center;
+  background: #000000a6;
+  border: none;
+  border-radius: 50%;
+  color: #fff;
+  cursor: pointer;
+  display: none;
+  font-size: 11px;
+  height: 20px;
+  justify-content: center;
+  line-height: 1;
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  width: 20px;
+  z-index: 2;
+}
+.tile:hover .tile-delete,
+.tile:focus-within .tile-delete,
+.tile:focus .tile-delete { display: flex; }
+.tile-delete:hover { background: #d32f2f; }
+.tile-badge {
+  animation: spin 0.9s linear infinite;
+  border: 3px solid #ffd9c2;
+  border-radius: 50%;
+  border-top-color: #FC5200;
+  height: 16px;
+  left: 6px;
+  position: absolute;
+  top: 6px;
+  width: 16px;
+  z-index: 2;
+}
+.tile:focus-visible,
+.add-tile:focus-visible {
+  outline: 2px solid #FC5200;
+  outline-offset: 2px;
+}
+.add-tile { border: 2px dashed #ccc; cursor: pointer; }
+
+/* ── Uploaded trail file rows with remove buttons ──────────────────────── */
+.uploaded-files-list ul { list-style: none; padding-left: 0; width: 100%; }
+.uploaded-file-row {
+  align-items: center;
+  background: #f6f8fa;
+  border: 1px solid #e3e8ee;
+  border-radius: 8px;
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 5px 8px;
+}
+.uploaded-file-name {
+  flex: 1 1 auto;
+  font-size: 0.9rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.uploaded-file-note { color: #b93c00; flex: 0 0 auto; font-size: 0.75rem; font-weight: 600; }
+.uploaded-file-remove {
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: #888;
+  cursor: pointer;
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 4px 6px;
+}
+.uploaded-file-remove:hover { background: #ffe0e0; color: #d32f2f; }
+
+/* ── Reset all (unobtrusive) ───────────────────────────────────────────── */
+.reset-all-button {
+  align-self: center;
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 0.8rem;
+  margin-top: 4px;
+  padding: 4px 8px;
+  text-decoration: underline;
+}
+.reset-all-button:hover { color: #d32f2f; }
+
+/* ── Focus visibility for keyboard users ───────────────────────────────── */
+.dropzone:focus-visible,
+.update-button:focus-visible,
+.download-button:focus-visible,
+.cancel-button:focus-visible,
+.shape-button:focus-visible,
+.reset-all-button:focus-visible,
+.uploaded-file-remove:focus-visible,
+.tile-delete:focus-visible,
+.error-close-button:focus-visible {
+  outline: 2px solid #FC5200;
+  outline-offset: 2px;
+}
+
+/* Mobile: keep the progress strip inside the viewport */
+@media (max-width: 768px) {
+  .progress-strip { left: 8px; right: 8px; top: 8px; }
+  .progress-map-preview { display: none; }
+}
+
+/* Action buttons: the renamed labels are longer — let them shrink instead
+   of overflowing the settings panel */
+.button-container { min-width: 0; gap: 6px; }
+.button-container .update-button,
+.button-container .download-button {
+  min-width: 0;
+  font-size: 0.9rem;
+  padding: 10px 4px;
+  line-height: 1.25;
+}

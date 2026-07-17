@@ -1,5 +1,6 @@
 """
-Topo Trail Generator – FastAPI backend
+Topo Trail Generator – FastAPI backend (routes + streaming plumbing only;
+the generation pipeline lives in src/pipeline.py).
 
 API contract aligned with topotrail.com:
 
@@ -12,8 +13,12 @@ API contract aligned with topotrail.com:
                                 {"type":"error","message": "..."}
                               The server generates ALL assets up front.
 
+  POST /api/preview           fast terrain-only generation (image.png only).
+
+  GET  /api/settings-schema   the default settings object (JSON).
+
   GET  /api/public/{job}/…    generated assets for the browser viewer:
-                              terrain.obj, trail{i}.obj, image.png, meta.json
+                              zone_*.stl, trail{i}.stl, image.png, meta.json
                               (plus the printable STLs).
 
   POST /api/download/{job}    body {"name": str} → ZIP with printable STLs.
@@ -23,292 +28,30 @@ import asyncio
 import hashlib
 import io
 import json
-import shutil
-import time
+import os
 import uuid as uuid_module
 import zipfile
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import numpy as np
+from src.gpx_handler import is_swim, parse_gpx_with_type
+from src.pipeline import GENERATED_DIR, GPX_STORE, cleanup_old_jobs, generate_job
+from src.settings import (  # noqa: F401  (re-exported: public schema surface)
+    DEFAULT_SETTINGS,
+    LEGACY_KEYS,
+    SettingsError,
+    normalize_settings,
+)
 
-from src.buildings import fetch_buildings
-from src.gpx_handler import get_gpx_bounds, is_swim, parse_gpx_with_type
-from src.mesh_generator import MeshGenerator
-from src.render_preview import render_preview_png
-from src.terrain import fetch_elevation_grid
-from src.water import fetch_map_features
-
-GENERATED_DIR = Path("generated")
-GPX_STORE     = GENERATED_DIR / "gpx"
-JOB_TTL_S     = 24 * 3600
-
-# Settings schema follows the topotrail.com front-end (camelCase), with
-# TopoTrail extensions. Colours are derived from the Strava-orange trail
-# (#FC5200, HSL h20/s1.0/l0.49): hues rotated, lightness/saturation kept in
-# the same family so the palette reads as one system.
-DEFAULT_SETTINGS = {
-    "waterColor":            "#306BA6",   # h210, complementary blue
-    "landColor":             "#327B4B",   # forest, h140
-    "trackColor":            "#FC5200",
-    "rockColor":             "#9A877E",   # same h20 hue, desaturated
-    "snowColor":             "#F3EFED",   # near-white, warm cast
-    "snowLevel":             0,           # 0 none → 1 everything under snow
-    "forestLevel":           0,           # 0 mapped forests only → 1 fully grown
-    "heightScale":           1,
-    "standardizeHeight":     False,  # lock total model height to 45 mm
-    "trailWidth":            1,
-    "trailHeight":           1,
-    "useHeightFromGpx":      False,
-    "shape":                 "hexagon",
-    "distanceTrackToBorder": 0,
-    # Base 15 mm (0.591") and relief 15 mm → 30 mm (1.182") total model height
-    "baseThickness":         15,
-    "includeSeas":           True,
-    "includeLakes":          True,
-    "includeRivers":         False,
-    "base_size":             108,   # hexagon width, point to point (mm)
-    "center":                "normal",
-    "buildings":             False,
-    "building_scale":        1,
-    "buildingsColor":        "#777777",
-    "printResolution":       0.2,   # mm per mesh cell: 0.1 / 0.2 / 0.4 / 0.8
-    "smooth":                True,  # cut zone boundaries along smooth curves
-    "singleColor":           False,
-    "singleColor_gap":       0.5,
-    # TopoTrail extensions (not on topotrail.com): hexagon border with text
-    "baseColor":             "#FFFFFF",
-    "textColor":             "#000000",
-    "borderLabels":          ["", "", "", "", "", ""],
-    # order: top, upper-right, lower-right, bottom, lower-left, upper-left
-}
-
-# Legacy snake_case names (old front-end) still accepted as fallbacks
-LEGACY_KEYS = {
-    "waterColor":            "water_color",
-    "landColor":             "land_color",
-    "trackColor":            "trail_color",
-    "rockColor":             "rock_color",
-    "heightScale":           "height_scale",
-    "trailWidth":            "trail_width",
-    "trailHeight":           "trail_height",
-    "useHeightFromGpx":      "use_gpx_elevation",
-    "distanceTrackToBorder": "trail_border",
-    "baseThickness":         "base_thickness",
-    "includeSeas":           "include_seas",
-    "includeLakes":          "include_lakes",
-    "includeRivers":         "include_rivers",
-    "center":                "center_on",
-    "buildings":             "include_buildings",
-    "singleColor":           "print_separately",
-}
-
-
-def normalize_settings(raw: dict) -> dict:
-    cfg = dict(DEFAULT_SETTINGS)
-    for key in DEFAULT_SETTINGS:
-        if key in raw:
-            cfg[key] = raw[key]
-        elif LEGACY_KEYS.get(key) in raw:
-            cfg[key] = raw[LEGACY_KEYS[key]]
-    return cfg
-
-
-def _resolve_center(cfg, points, bounds):
-    """Return (lat_c, lon_c) based on the `center` setting."""
-    center = cfg.get("center", "normal")
-    lat_c = bounds["lat_center"]
-    lon_c = bounds["lon_center"]
-    if center == "start" and points:
-        lat_c, lon_c = points[0][0], points[0][1]
-    elif center == "end" and points:
-        lat_c, lon_c = points[-1][0], points[-1][1]
-    elif center in ("highestPoint", "highest") and points:
-        hp = max(points, key=lambda p: p[2])
-        lat_c, lon_c = hp[0], hp[1]
-    elif center in ("furthestAway", "furthest") and points:
-        s = points[0]
-        fp = max(points, key=lambda p: (p[0] - s[0]) ** 2 + (p[1] - s[1]) ** 2)
-        lat_c, lon_c = fp[0], fp[1]
-    return lat_c, lon_c
-
-
-def _cleanup_old_jobs():
-    if not GENERATED_DIR.exists():
-        return
-    now = time.time()
-    for d in GENERATED_DIR.iterdir():
-        if d.is_dir() and d.name != "gpx" and now - d.stat().st_mtime > JOB_TTL_S:
-            shutil.rmtree(d, ignore_errors=True)
-
-
-def _generate_job(job_dir: Path, trails: list, cfg: dict, progress,
-                  terrain_only: bool = False):
-    """
-    Blocking generation pipeline: elevation → water/buildings → meshes → assets.
-    trails: list of {"points": [(lat, lon, ele)...], "flat": bool} per GPX file
-            (flat=True for swims — the ribbon stays at one height).
-    progress(msg): callback for user-facing status messages; dicts are
-            forwarded verbatim to the NDJSON stream (e.g. the early
-            {"type": "image"} event once the 2D map preview is ready).
-    terrain_only: stop after the 2D map preview (image.png + meta.json) —
-            used by the fast "Generate Terrain" button; no meshes are built.
-    """
-    all_points = [p for t in trails for p in t["points"]]
-    bounds = get_gpx_bounds(all_points)
-    if not bounds:
-        raise ValueError("Could not compute bounds from the GPX files")
-
-    lat_c, lon_c = _resolve_center(cfg, all_points, bounds)
-
-    # Border ring with text labels: hexagon models only (for now)
-    labels = [str(x) for x in (cfg.get("borderLabels") or [])][:6]
-    has_labels = cfg["shape"] == "hexagon" and any(x.strip() for x in labels)
-    base_size = float(cfg["base_size"])
-
-    # Physical print fidelity: mm per mesh cell (0.1 / 0.2 / 0.4 / 0.8)
-    cell_mm = min(0.8, max(0.1, float(cfg["printResolution"])))
-    mesh_cfg = {
-        "target_size_mm":     base_size,
-        "base_thickness_mm":  float(cfg["baseThickness"]),
-        "height_scale":       max(0.0, float(cfg["heightScale"])),
-        "standardize_height": bool(cfg["standardizeHeight"]),
-        "min_feature_mm":     2.0 * cell_mm,
-        "smooth_zones":       bool(cfg["smooth"]),
-        "building_height_mm": 2.0 * max(0.1, float(cfg["building_scale"])),
-        "route_width_mm":     max(float(cfg["trailWidth"]), cell_mm),
-        "route_height_mm":    float(cfg["trailHeight"]),
-        "shape":              cfg["shape"],
-        "border_mm":          max(6.0, 0.08 * base_size) if has_labels else 0.0,
-        "border_labels":      labels,
-    }
-    gen = MeshGenerator(mesh_cfg)
-
-    # Zoom out until the whole route fits INSIDE the model shape (hexagon
-    # corners cut into the bounding box) with 5% clearance by default;
-    # the "Distance Trail to Border" slider (0–1) adds up to +50% more.
-    knob = min(1.0, max(0.0, float(cfg["distanceTrackToBorder"])))
-    margin_frac = 0.05 + 0.5 * knob
-    size_km = gen.fit_size_km(all_points, lat_c, lon_c, bounds["span_km"], margin_frac)
-
-    # Mesh density from the chosen fidelity: one cell per cell_mm of model.
-    # The browser viewer gets a capped copy (0.4 mm) so it stays responsive;
-    # the printable STLs use the full density — the slicer decides the rest.
-    n_print = min(1100, round(base_size / cell_mm) + 1)
-    n_view = min(n_print, round(base_size / 0.2) + 1)
-
-    progress("Downloading elevation data")
-    grid, lat_b, lon_b = fetch_elevation_grid(lat_c, lon_c, size_km, n_print)
-    grid_view = grid if n_view == n_print else \
-        fetch_elevation_grid(lat_c, lon_c, size_km, n_view)[0]
-
-    progress("Downloading map features (water, forests)")
-    water_data, forest_data = None, None
-    try:
-        all_water, forest_data = fetch_map_features(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-        water_data = [
-            w for w in all_water
-            if (w["type"] == "lake"  and cfg["includeLakes"])
-            or (w["type"] == "sea"   and cfg["includeSeas"])
-            or (w["type"] == "river" and cfg["includeRivers"])
-        ]
-    except Exception:
-        import traceback
-        traceback.print_exc()   # degrade to a plain terrain model, but say why
-
-    buildings_data = None
-    if cfg["buildings"]:
-        progress("Downloading buildings")
-        try:
-            buildings_data = fetch_buildings(lat_b[0], lat_b[1], lon_b[0], lon_b[1])
-        except Exception:
-            buildings_data = None
-
-    progress("Generating 3D mesh")
-
-    # For open seas/bays, SRTM returns ~0 m — use elevation threshold
-    detect_ocean_m = 0.5 if cfg["includeSeas"] else None
-
-    zone_kwargs = dict(
-        buildings=buildings_data, water=water_data, forests=forest_data,
-        forest_level=float(cfg["forestLevel"]),
-        snow_level=float(cfg["snowLevel"]), detect_ocean_m=detect_ocean_m,
-    )
-    gen_view = MeshGenerator(mesh_cfg)
-    zones_view = gen_view.generate_zone_tris(grid_view, lat_b, lon_b, **zone_kwargs)
-    # 2D map preview first — the client can show it while the 3D build runs
-    job_dir.mkdir(parents=True, exist_ok=True)
-    render_preview_png(
-        grid_view, gen_view.last_zone_map, MeshGenerator.ZONES, lat_b, lon_b,
-        [t["points"] for t in trails],
-        {
-            "forest": cfg["landColor"],
-            "rock":   cfg["rockColor"],
-            "water":  cfg["waterColor"],
-            "snow":   cfg["snowColor"],
-            "track":  cfg["trackColor"],
-        },
-        job_dir / "image.png",
-    )
-    progress({"type": "image", "path": job_dir.name})
-
-    if terrain_only:
-        (job_dir / "meta.json").write_text(json.dumps({
-            "settings":    cfg,
-            "terrainOnly": True,
-            "trailAmount": len(trails),
-            "eleMin":      float(grid.min()),
-            "eleMax":      float(grid.max()),
-            "gpxCount":    len(all_points),
-        }))
-        return
-
-    use_gpx_ele = bool(cfg["useHeightFromGpx"])
-
-    # Viewer assets: one binary STL per colour zone at the view density
-    border_view = gen_view.border_tris()
-    zones_view["base"] = zones_view["base"] + border_view["base"]
-    zones_view["text"] = border_view["text"]
-    for name, tris in zones_view.items():
-        if tris:
-            (job_dir / f"zone_{name}.stl").write_bytes(gen_view.to_stl_bytes(tris))
-
-    # Printable STLs at full fidelity
-    if n_print != n_view:
-        progress("Building print-quality mesh")
-    zones = (zones_view if n_print == n_view else
-             gen.generate_zone_tris(grid, lat_b, lon_b, **zone_kwargs))
-    printer = gen if n_print != n_view else gen_view
-    trail_tris = [
-        printer.route_tris(t["points"], flat=t["flat"], use_gpx_ele=use_gpx_ele)
-        for t in trails
-    ]
-    if n_print != n_view:
-        border = printer.border_tris()
-        zones["base"] = zones["base"] + border["base"]
-        zones["text"] = border["text"]
-
-    progress("Writing model files")
-    terrain_tris = [t for tris in zones.values() for t in tris]
-    all_trail_tris = [t for tris in trail_tris for t in tris]
-    (job_dir / "map.stl").write_bytes(printer.to_stl_bytes(terrain_tris + all_trail_tris))
-    (job_dir / "terrain.stl").write_bytes(printer.to_stl_bytes(terrain_tris))
-    for i, tris in enumerate(trail_tris):
-        (job_dir / f"trail{i}.stl").write_bytes(printer.to_stl_bytes(tris))
-
-    (job_dir / "meta.json").write_text(json.dumps({
-        "settings":    cfg,
-        "trailAmount": len(trails),
-        "eleMin":      float(grid.min()),
-        "eleMax":      float(grid.max()),
-        "gpxCount":    len(all_points),
-    }))
-
+# Concurrency guard: at most N generation jobs run at once (env-overridable)
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("TOPOTRAIL_MAX_JOBS", "2")))
+_job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 app = FastAPI(title="Topo Trail Generator")
 app.add_middleware(
@@ -322,6 +65,12 @@ app.add_middleware(
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
+
+
+@app.get("/api/settings-schema")
+async def settings_schema():
+    """The default settings object — the front-end builds its form from it."""
+    return DEFAULT_SETTINGS
 
 
 # ── Upload / generate endpoints ───────────────────────────────────────────────
@@ -348,8 +97,10 @@ async def preview(
 async def _generate_endpoint(file, fileHash, settings, terrain_only):
     try:
         cfg = normalize_settings(json.loads(settings))
-    except json.JSONDecodeError:
-        raise HTTPException(400, "Invalid settings JSON")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "Invalid settings JSON") from exc
+    except SettingsError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     # Resolve GPX contents: new uploads and/or previously stored hashes
     GPX_STORE.mkdir(parents=True, exist_ok=True)
@@ -367,8 +118,8 @@ async def _generate_endpoint(file, fileHash, settings, terrain_only):
     if not contents and fileHash:
         try:
             requested = json.loads(fileHash)
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Invalid fileHash JSON")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "Invalid fileHash JSON") from exc
         for h in requested:
             p = GPX_STORE / f"{Path(str(h)).name}.gpx"
             if not p.exists():
@@ -412,14 +163,16 @@ async def _generate_endpoint(file, fileHash, settings, terrain_only):
                 yield line({"type": "error", "message": "No points found in the GPX files"})
                 return
 
-            _cleanup_old_jobs()
+            cleanup_old_jobs()
             job_id = uuid_module.uuid4().hex[:12]
             job_dir = GENERATED_DIR / job_id
 
-            task = asyncio.create_task(
-                asyncio.to_thread(_generate_job, job_dir, trails, cfg, progress,
-                                  terrain_only)
-            )
+            async def run_guarded():
+                async with _job_semaphore:
+                    await asyncio.to_thread(generate_job, job_dir, trails, cfg,
+                                            progress, terrain_only)
+
+            task = asyncio.create_task(run_guarded())
             while not task.done():
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -476,7 +229,7 @@ async def download(job_id: str, body: dict):
     )
 
 
-# Generated assets (terrain.obj, trail{i}.obj, image.png, meta.json, STLs)
+# Generated assets (zone_*.stl, trail{i}.stl, image.png, meta.json, STLs)
 GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/api/public", StaticFiles(directory=GENERATED_DIR), name="public")
 

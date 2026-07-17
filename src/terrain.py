@@ -42,7 +42,9 @@ def fetch_elevation_grid(lat_center, lon_center, size_km, resolution=200):
         lat_bounds     : (lat_min, lat_max)
         lon_bounds     : (lon_min, lon_max)
     """
-    resolution = max(10, min(resolution, 500))
+    # Tile mosaics handle high densities fine; 1200 covers the finest print
+    # fidelity (0.1 mm cells on large models) without silent degradation.
+    resolution = max(10, min(resolution, 1200))
     try:
         return _fetch_from_tiles(lat_center, lon_center, size_km, resolution)
     except Exception:
@@ -123,8 +125,10 @@ def _fetch_from_tiles(lat_center, lon_center, size_km, resolution):
 
     px = np.clip(px, 0, cols_px - 1.001)
     py = np.clip(py, 0, rows_px - 1.001)
-    x0 = px.astype(int); y0 = py.astype(int)
-    fx = px - x0;        fy = py - y0
+    x0 = px.astype(int)
+    y0 = py.astype(int)
+    fx = px - x0
+    fy = py - y0
 
     grid = (
         mosaic[y0,     x0    ] * (1 - fx) * (1 - fy)
@@ -148,7 +152,8 @@ def _fetch_from_opentopodata(lat_center, lon_center, size_km, resolution=50):
     lons = np.linspace(lon_min, lon_max, resolution)   # west  → east
     lat_grid, lon_grid = np.meshgrid(lats, lons, indexing="ij")
 
-    locations = list(zip(lat_grid.flatten().tolist(), lon_grid.flatten().tolist()))
+    locations = list(zip(lat_grid.flatten().tolist(), lon_grid.flatten().tolist(),
+                         strict=True))
     elevations = []
     batch_size = 100
 

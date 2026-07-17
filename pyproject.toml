@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["generated", ".venv", "gpx-examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E741",   # short math names (a, b, l) are idiomatic in the mesh code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["B008"]   # File(None)/Form(...) in defaults is the FastAPI idiom

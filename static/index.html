@@ -36,25 +36,28 @@
     </div>
   </div>
 
-  <!-- Loading overlay -->
-  <div class="loading-overlay" id="loadingOverlay" hidden>
-    <div class="loading-text">
-      Generating Map... This can take a while.
-      <div class="loading-message" id="loadingMessage"></div>
-      <img id="loadingMapPreview" class="loading-map-preview" alt="Map preview" hidden />
-      <div class="loading-donate-message">
-        Support the project with a
-        <a href="https://buymeacoffee.com/topotrail" target="_blank" rel="noopener noreferrer" class="donate-link">donation</a>.
-      </div>
-    </div>
-  </div>
-
   <div class="container">
 
     <!-- ════════ Left column ════════ -->
     <div class="left-column">
       <div class="top-left" id="topLeft">
-        <div class="dropzone" id="dropzone">
+
+        <!-- Non-blocking progress strip: settings stay editable while a job runs -->
+        <div class="progress-strip" id="progressStrip" hidden>
+          <div class="progress-spinner" aria-hidden="true"></div>
+          <div class="progress-info">
+            <div class="progress-stage" id="progressStage" role="status" aria-live="polite"></div>
+            <div class="progress-donate">
+              Support the project with a
+              <a href="https://buymeacoffee.com/topotrail" target="_blank" rel="noopener noreferrer" class="donate-link">donation</a>.
+            </div>
+          </div>
+          <img id="progressMapPreview" class="progress-map-preview" alt="Early map preview" hidden />
+          <button type="button" class="cancel-button" id="cancelBtn">Cancel</button>
+        </div>
+
+        <div class="dropzone" id="dropzone" role="button" tabindex="0"
+             aria-label="Add GPX files: drag and drop or press Enter to browse">
           Drag &amp; drop your .gpx files here, or click to select
           <input type="file" id="fileInput" accept=".gpx" multiple hidden />
         </div>
@@ -300,21 +303,28 @@
 
           <h2 class="category-title">Add trail</h2>
           <div class="settings-group">
-            <div class="dropzone" id="addTrailDropzone">
+            <div class="dropzone" id="addTrailDropzone" role="button" tabindex="0"
+                 aria-label="Add more GPX trails to this tile: drag and drop or press Enter to browse">
               Drag &amp; drop your .gpx files here, or click to select
               <input type="file" id="addTrailInput" accept=".gpx" multiple hidden />
             </div>
             <div class="uploaded-files-list" id="uploadedFilesList" hidden><ul></ul></div>
           </div>
 
-          <button class="update-button" id="applyAllBtn">Apply Settings to all Files</button>
+          <button type="button" class="update-button" id="applyAllBtn">Apply Settings to all Files</button>
+
+          <button type="button" class="reset-all-button" id="resetAllBtn"
+                  title="Clear all tiles, settings and generated models">Reset all</button>
 
         </div><!-- /settings-scroll -->
 
+        <div class="dirty-hint" id="dirtyHint" hidden>
+          Settings changed — regenerate to update the model.
+        </div>
         <div class="button-container">
-          <button class="update-button" id="terrainBtn" title="Fast 2D map preview — no 3D model">Terrain</button>
-          <button class="update-button" id="updateBtn">Update</button>
-          <button class="download-button" id="downloadBtn">Download</button>
+          <button type="button" class="update-button" id="terrainBtn" title="Fast 2D map preview — no 3D model">2D Preview</button>
+          <button type="button" class="update-button" id="updateBtn">Generate 3D</button>
+          <button type="button" class="download-button" id="downloadBtn" disabled>Download STL</button>
         </div>
       </div>
     </div>

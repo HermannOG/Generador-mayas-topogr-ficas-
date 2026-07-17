@@ -3,7 +3,7 @@
  * Loads one binary STL per colour zone (zone_<name>.stl) plus trail{i}.stl,
  * all produced by /api/upload. Terrain zones get welded vertices and smooth
  * normals; the base slab and text keep crisp flat shading.
- * Exposes: window.Preview3D = { renderJob, clear }
+ * Exposes: window.Preview3D = { renderJob, clear, applyColors }
  */
 
 import * as THREE from "three";
@@ -18,6 +18,7 @@ const SMOOTH_ZONES = new Set(["rock", "forest", "water", "snow", "trail"]);
 let renderer, scene, camera, controls;
 let animId = null;
 let geoGroup = null;
+let renderSeq = 0;   // guards against interleaved renderJob calls
 
 const stlLoader = new STLLoader();
 
@@ -74,7 +75,22 @@ function makeMaterial(colorHex) {
   });
 }
 
-async function loadZone(url, colorHex, smooth) {
+// Free GPU resources held by every mesh in a group. STL geometries and
+// their materials are only ours — nothing is shared — so a straight
+// dispose() of both is safe. Without this, repeated regenerations leak
+// GPU memory (the WebGL buffers survive garbage collection).
+function disposeGroup(group) {
+  if (!group) return;
+  group.traverse(obj => {
+    if (obj.isMesh) {
+      obj.geometry?.dispose();
+      if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+      else obj.material?.dispose();
+    }
+  });
+}
+
+async function loadZone(url, colorHex, smooth, zone) {
   const resp = await fetch(url);
   if (!resp.ok) return null;
   let geometry = stlLoader.parse(await resp.arrayBuffer());
@@ -87,13 +103,12 @@ async function loadZone(url, colorHex, smooth) {
   const mesh = new THREE.Mesh(geometry, makeMaterial(colorHex));
   mesh.castShadow    = true;
   mesh.receiveShadow = true;
+  mesh.userData.zone = zone;   // lets applyColors() retarget by zone later
   return mesh;
 }
 
-async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
-  if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
-
-  const zoneColor = {
+function zoneColorMap(settings) {
+  return {
     rock:      settings.rockColor      ?? "#9A877E",
     forest:    settings.landColor      ?? "#327B4B",
     water:     settings.waterColor     ?? "#306BA6",
@@ -101,23 +116,50 @@ async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 })
     buildings: settings.buildingsColor ?? "#777777",
     base:      settings.baseColor      ?? "#FFFFFF",
     text:      settings.textColor      ?? "#000000",
+    trail:     settings.trackColor     ?? "#FC5200",
   };
-  const trackColor = settings.trackColor ?? "#FC5200";
+}
 
-  geoGroup = new THREE.Group();
+/**
+ * Load and display the STL set for a job. Returns true if the new model was
+ * committed to the scene, false if this call was superseded by a newer
+ * renderJob before its downloads finished (caller should not record it as
+ * "rendered" in that case).
+ */
+async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 }) {
+  const seq = ++renderSeq;
+
+  const colors = zoneColorMap(settings);
 
   const jobs = ZONE_NAMES.map(name =>
     loadZone(`${base}/zone_${name}.stl?v=${cacheKey}`,
-             zoneColor[name], SMOOTH_ZONES.has(name)));
+             colors[name], SMOOTH_ZONES.has(name), name));
   for (let i = 0; i < trailAmount; i++) {
-    jobs.push(loadZone(`${base}/trail${i}.stl?v=${cacheKey}`, trackColor, true));
+    jobs.push(loadZone(`${base}/trail${i}.stl?v=${cacheKey}`, colors.trail, true, "trail"));
   }
-  for (const mesh of await Promise.all(jobs)) {
-    if (mesh) geoGroup.add(mesh);
+
+  const meshes = (await Promise.all(jobs)).filter(Boolean);
+
+  const newGroup = new THREE.Group();
+  for (const mesh of meshes) newGroup.add(mesh);
+
+  if (seq !== renderSeq) {
+    // A newer renderJob started while we were downloading — drop this one.
+    disposeGroup(newGroup);
+    return false;
   }
-  if (geoGroup.children.length === 0) {
+
+  if (newGroup.children.length === 0) {
     throw new Error("no model files found");
   }
+
+  // Swap in the new model only now, so the previous one stays visible
+  // while the replacement downloads.
+  if (geoGroup) {
+    scene.remove(geoGroup);
+    disposeGroup(geoGroup);
+  }
+  geoGroup = newGroup;
 
   // Centre the model at origin, base on the ground plane
   const bbox = new THREE.Box3().setFromObject(geoGroup);
@@ -137,10 +179,30 @@ async function renderJob({ base, trailAmount = 1, settings = {}, cacheKey = 0 })
   controls.update();
 
   startAnimate();
+  return true;
+}
+
+/**
+ * Live-update material colours on the currently displayed model.
+ * Colours are pure material state — no re-download or rebuild needed.
+ */
+function applyColors(settings = {}) {
+  if (!geoGroup) return;
+  const colors = zoneColorMap(settings);
+  geoGroup.traverse(obj => {
+    if (obj.isMesh && obj.userData.zone && colors[obj.userData.zone]) {
+      obj.material.color.set(colors[obj.userData.zone]);
+    }
+  });
 }
 
 function clear() {
-  if (geoGroup) { scene.remove(geoGroup); geoGroup = null; }
+  renderSeq += 1;   // invalidate any in-flight renderJob
+  if (geoGroup) {
+    scene.remove(geoGroup);
+    disposeGroup(geoGroup);
+    geoGroup = null;
+  }
   stopAnimate();
 }
 
@@ -158,6 +220,12 @@ function stopAnimate() {
   if (animId) { cancelAnimationFrame(animId); animId = null; }
 }
 
-window.addEventListener("DOMContentLoaded", initScene);
+// The module may finish loading (CDN import) after DOMContentLoaded fired.
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", initScene);
+} else {
+  initScene();
+}
 
-window.Preview3D = { renderJob, clear };
+window.Preview3D = { renderJob, clear, applyColors };
+window.dispatchEvent(new Event("preview3d-ready"));
